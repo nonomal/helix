@@ -35,7 +35,7 @@
   (non_boundary_assertion)
 ] @constant.character.escape
 
-(group_name) @property
+(group_name) @label
 
 (count_quantifier
   [
@@ -50,4 +50,3 @@
   ])
 
 (class_character) @constant.character
-(pattern_character) @string
