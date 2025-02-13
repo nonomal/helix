@@ -16,8 +16,8 @@
    (section_marker) @markup.heading.marker)
  (#eq? @markup.heading.marker "===="))
 
-(macro (tag) @function.macro)
 (tag) @keyword
+(macro (tag) @function.macro)
 (macro_escape) @constant.character.escape
 (inline_quote) @markup.raw.inline
 (email_address) @markup.link.url
@@ -39,12 +39,14 @@
 ; could be @constant.numeric.integer but this looks similar to a capture
 (arity) @operator
 
-[":" "/"] @operator
-["(" ")"] @punctuation.delimiter
-["{" "}"] @function.macro
+(expression [":" "/"] @operator)
+(expression ["(" ")"] @punctuation.delimiter)
+(macro ["{" "}"] @function.macro)
 
 [
   (quote_marker)
   (language_identifier)
   (quote_content)
 ] @markup.raw.block
+
+(parameter) @variable.parameter

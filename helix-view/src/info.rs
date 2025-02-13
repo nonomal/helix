@@ -1,6 +1,6 @@
-use crate::input::KeyEvent;
-use helix_core::{register::Registers, unicode::width::UnicodeWidthStr};
-use std::{collections::BTreeSet, fmt::Write};
+use crate::register::Registers;
+use helix_core::unicode::width::UnicodeWidthStr;
+use std::fmt::Write;
 
 #[derive(Debug)]
 /// Info box used in editor. Rendering logic will be in other crate.
@@ -16,7 +16,11 @@ pub struct Info {
 }
 
 impl Info {
-    pub fn new(title: &str, body: Vec<(String, String)>) -> Self {
+    pub fn new<T, U>(title: &str, body: &[(T, U)]) -> Self
+    where
+        T: AsRef<str>,
+        U: AsRef<str>,
+    {
         if body.is_empty() {
             return Self {
                 title: title.to_string(),
@@ -26,11 +30,21 @@ impl Info {
             };
         }
 
-        let item_width = body.iter().map(|(item, _)| item.width()).max().unwrap();
+        let item_width = body
+            .iter()
+            .map(|(item, _)| item.as_ref().width())
+            .max()
+            .unwrap();
         let mut text = String::new();
 
-        for (item, desc) in &body {
-            let _ = writeln!(text, "{:width$}  {}", item, desc, width = item_width);
+        for (item, desc) in body {
+            let _ = writeln!(
+                text,
+                "{:width$}  {}",
+                item.as_ref(),
+                desc.as_ref(),
+                width = item_width
+            );
         }
 
         Self {
@@ -41,34 +55,13 @@ impl Info {
         }
     }
 
-    pub fn from_keymap(title: &str, body: Vec<(&str, BTreeSet<KeyEvent>)>) -> Self {
-        let body = body
-            .into_iter()
-            .map(|(desc, events)| {
-                let events = events.iter().map(ToString::to_string).collect::<Vec<_>>();
-                (events.join(", "), desc.to_string())
-            })
-            .collect();
-
-        Self::new(title, body)
-    }
-
     pub fn from_registers(registers: &Registers) -> Self {
-        let body = registers
-            .inner()
-            .iter()
-            .map(|(ch, reg)| {
-                let content = reg
-                    .read()
-                    .get(0)
-                    .and_then(|s| s.lines().next())
-                    .map(String::from)
-                    .unwrap_or_default();
-                (ch.to_string(), content)
-            })
+        let body: Vec<_> = registers
+            .iter_preview()
+            .map(|(ch, preview)| (ch.to_string(), preview))
             .collect();
 
-        let mut infobox = Self::new("Registers", body);
+        let mut infobox = Self::new("Registers", &body);
         infobox.width = 30; // copied content could be very long
         infobox
     }

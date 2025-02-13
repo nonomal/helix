@@ -19,6 +19,8 @@
 	"SHELL"
 	"MAINTAINER"
 	"CROSS_BUILD"
+	(heredoc_marker)
+	(heredoc_end)
 ] @keyword
 
 [
@@ -35,7 +37,21 @@
 	(image_digest
 		"@" @punctuation.special))
 
-(double_quoted_string) @string
+[
+	(double_quoted_string)
+	(single_quoted_string)
+	(json_string)
+	(heredoc_line)
+] @string
+
+[
+  (heredoc_marker)
+  (heredoc_end)
+] @label
+
+((heredoc_block
+  (heredoc_line) @string)
+  (#set! "priority" 90))
 
 (expansion
   [
@@ -48,4 +64,10 @@
 ((variable) @constant
  (#match? @constant "^[A-Z][A-Z_0-9]*$"))
 
+[
+	(param)
+	(mount_param)
+] @constant
 
+(expose_instruction
+  (expose_port) @constant.numeric.integer)

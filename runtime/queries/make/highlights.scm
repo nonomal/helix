@@ -45,7 +45,9 @@
  (raw_text)
 ] @string
 
-(variable_assignment (word) @string)
+(variable_assignment (word) @variable)
+(shell_text
+  [(variable_reference (word) @variable.parameter)])
 
 [
  "ifeq"
@@ -139,6 +141,7 @@
   function: "info"
   (arguments (text) @info))
 
+
 ;; Install Command Categories
 ;; Others special variables
 ;; Variables Used by Implicit Rules
@@ -155,7 +158,7 @@
   (word) @clean @constant.builtin
   (#match? @clean "^(AR|AS|CC|CXX|CPP|FC|M2C|PC|CO|GET|LEX|YACC|LINT|MAKEINFO|TEX|TEXI2DVI|WEAVE|CWEAVE|TANGLE|CTANGLE|RM|ARFLAGS|ASFLAGS|CFLAGS|CXXFLAGS|COFLAGS|CPPFLAGS|FFLAGS|GFLAGS|LDFLAGS|LDLIBS|LFLAGS|YFLAGS|PFLAGS|RFLAGS|LINTFLAGS|PRE_INSTALL|POST_INSTALL|NORMAL_INSTALL|PRE_UNINSTALL|POST_UNINSTALL|NORMAL_UNINSTALL|MAKEFILE_LIST|MAKE_RESTARTS|MAKE_TERMOUT|MAKE_TERMERR|\.DEFAULT_GOAL|\.RECIPEPREFIX|\.EXTRA_PREREQS\.VARIABLES|\.FEATURES|\.INCLUDE_DIRS|\.LOADED)$"))
 
-;; Standart targets
+;; Standard targets
 (targets
   (word) @constant.macro
   (#match? @constant.macro "^(all|install|install-html|install-dvi|install-pdf|install-ps|uninstall|install-strip|clean|distclean|mostlyclean|maintainer-clean|TAGS|info|dvi|html|pdf|ps|dist|check|installcheck|installdirs)$"))
@@ -168,3 +171,5 @@
 (targets
   (word) @constant.macro
   (#match? @constant.macro "^\.(PHONY|SUFFIXES|DEFAULT|PRECIOUS|INTERMEDIATE|SECONDARY|SECONDEXPANSION|DELETE_ON_ERROR|IGNORE|LOW_RESOLUTION_TIME|SILENT|EXPORT_ALL_VARIABLES|NOTPARALLEL|ONESHELL|POSIX)$"))
+
+(targets (word) @constant)
