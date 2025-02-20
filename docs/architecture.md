@@ -1,13 +1,14 @@
 
-| Crate        | Description                                                      |
-| -----------  | -----------                                                      |
-| helix-core   | Core editing primitives, functional.                             |
-| helix-lsp    | Language server client                                           |
-| helix-dap    | Debug Adapter Protocol (DAP) client                              |
-| helix-loader | Functions for building, fetching, and loading external resources |
-| helix-view   | UI abstractions for use in backends, imperative shell.           |
-| helix-term   | Terminal UI                                                      |
-| helix-tui    | TUI primitives, forked from tui-rs, inspired by Cursive          |
+| Crate           | Description                                                      |
+| -----------     | -----------                                                      |
+| helix-core      | Core editing primitives, functional.                             |
+| helix-lsp       | Language server client                                           |
+| helix-lsp-types | Language Server Protocol type definitions                        |
+| helix-dap       | Debug Adapter Protocol (DAP) client                              |
+| helix-loader    | Functions for building, fetching, and loading external resources |
+| helix-view      | UI abstractions for use in backends, imperative shell.           |
+| helix-term      | Terminal UI                                                      |
+| helix-tui       | TUI primitives, forked from tui-rs, inspired by Cursive          |
 
 
 This document contains a high-level overview of Helix internals.
@@ -32,7 +33,7 @@ represented by a `Selection`. Each `Range` in the selection consists of a moving
 a selection with a single range, with the head and the anchor in the same
 position.
 
-Ropes are modified by constructing an OT-like `Transaction`. It's represents
+Ropes are modified by constructing an OT-like `Transaction`. It represents
 a single coherent change to the document and can be applied to the rope.
 A transaction can be inverted to produce an undo. Selections and marks can be
 mapped over a transaction to translate to a position in the new text state after

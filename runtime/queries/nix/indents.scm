@@ -1,25 +1,22 @@
+[
+  (indented_string_expression)
+  (string_expression)
+
+  ; these are all direct parents of (binding_set)
+  (attrset_expression)
+  (let_attrset_expression)
+  (rec_attrset_expression)
+  (let_expression)
+
+  (list_expression)
+  (parenthesized_expression)
+] @indent
+
+
+(if_expression [ "if" "then" "else" ] @align)
 
 [
-  ; Bracket like
-  (let)
-  (attrset)
-  (rec_attrset)
-  (let_attrset)
-  (parenthesized)
-  (list)
-
-  ; Binding
-  (bind)
-  (inherit)
-  (inherit_from)
-  (formal)
-
-  ; Binary operations
-  (binary)
-  (has_attr)
-  (select)
-  (app)
-
-  ; Conditional
-  (if)
-] @indent
+  "}"
+  "]"
+  ")"
+] @outdent
