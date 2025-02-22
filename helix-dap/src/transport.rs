@@ -1,4 +1,4 @@
-use crate::{Error, Event, Result};
+use crate::{Error, Result};
 use anyhow::Context;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ pub struct Request {
     pub arguments: Option<Value>,
 }
 
-#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub struct Response {
     // seq is omitted as unused and is not sent by some implementations
     pub request_seq: u64,
@@ -32,11 +32,17 @@ pub struct Response {
     pub body: Option<Value>,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+pub struct Event {
+    pub event: String,
+    pub body: Option<Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Payload {
     // type = "event"
-    Event(Box<Event>),
+    Event(Event),
     // type = "response"
     Response(Response),
     // type = "request"
@@ -238,30 +244,52 @@ impl Transport {
         let mut recv_buffer = String::new();
         loop {
             match Self::recv_server_message(&mut server_stdout, &mut recv_buffer).await {
-                Ok(msg) => {
-                    transport
-                        .process_server_message(&client_tx, msg)
-                        .await
-                        .unwrap();
-                }
+                Ok(msg) => match transport.process_server_message(&client_tx, msg).await {
+                    Ok(_) => (),
+                    Err(err) => {
+                        error!("err: <- {err:?}");
+                        break;
+                    }
+                },
                 Err(err) => {
-                    error!("err: <- {:?}", err);
-                    break;
+                    if !matches!(err, Error::StreamClosed) {
+                        error!("Exiting after unexpected error: {err:?}");
+                    }
+
+                    // Close any outstanding requests.
+                    for (id, tx) in transport.pending_requests.lock().await.drain() {
+                        match tx.send(Err(Error::StreamClosed)).await {
+                            Ok(_) => (),
+                            Err(_) => {
+                                error!("Could not close request on a closed channel (id={id})");
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    async fn send(
+    async fn send_inner(
         transport: Arc<Self>,
         mut server_stdin: Box<dyn AsyncWrite + Unpin + Send>,
         mut client_rx: UnboundedReceiver<Payload>,
-    ) {
+    ) -> Result<()> {
         while let Some(payload) = client_rx.recv().await {
             transport
                 .send_payload_to_server(&mut server_stdin, payload)
-                .await
-                .unwrap()
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn send(
+        transport: Arc<Self>,
+        server_stdin: Box<dyn AsyncWrite + Unpin + Send>,
+        client_rx: UnboundedReceiver<Payload>,
+    ) {
+        if let Err(err) = Self::send_inner(transport, server_stdin, client_rx).await {
+            error!("err: <- {:?}", err);
         }
     }
 

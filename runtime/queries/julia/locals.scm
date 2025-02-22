@@ -1,59 +1,101 @@
+; -----------
+; Definitions
+; -----------
 
-(import_statement
- (identifier) @definition.import)
-(variable_declaration
- (identifier) @local.definition)
-(variable_declaration
- (tuple_expression
-  (identifier) @local.definition))
-(for_binding
- (identifier) @local.definition)
-(for_binding
- (tuple_expression
-  (identifier) @local.definition))
+; Variables
+(assignment
+  (identifier) @local.definition)
 
-(assignment_expression
- (tuple_expression
-  (identifier) @local.definition))
-(assignment_expression
- (bare_tuple_expression
-  (identifier) @local.definition))
-(assignment_expression
- (identifier) @local.definition)
+(assignment
+  (tuple_expression
+    (identifier) @local.definition))
+
+; Constants
+(const_statement
+  (assignment
+    . (identifier) @local.definition))
+
+; let/const bindings
+(let_binding
+  (identifier) @local.definition)
+
+(let_binding
+  (tuple_expression
+    (identifier) @local.definition))
+
+; For bindings
+(for_binding
+  (identifier) @local.definition)
+
+(for_binding
+  (tuple_expression
+    (identifier) @local.definition))
+
+; Types
+(struct_definition
+  name: (identifier) @local.definition)
+
+(abstract_definition
+  name: (identifier) @local.definition)
+
+(abstract_definition
+  name: (identifier) @local.definition)
 
 (type_parameter_list
-  (identifier) @definition.type)
-(type_argument_list
-  (identifier) @definition.type)
-(struct_definition
-  name: (identifier) @definition.type)
+  (identifier) @local.definition)
 
+; Module imports
+(import_statement
+  (identifier) @local.definition)
+
+; Parameters
 (parameter_list
- (identifier) @definition.parameter)
-(typed_parameter
- (identifier) @definition.parameter
- (identifier))
-(function_expression
- . (identifier) @definition.parameter)
-(argument_list
- (typed_expression
-  (identifier) @definition.parameter
-  (identifier)))
-(spread_parameter
- (identifier) @definition.parameter)
+  (identifier) @local.definition)
 
+(optional_parameter
+  .
+  (identifier) @local.definition)
+
+(slurp_parameter
+  (identifier) @local.definition)
+
+(typed_parameter
+  parameter: (identifier) @local.definition
+  (_))
+
+; Single parameter arrow function
+(function_expression
+  .
+  (identifier) @local.definition)
+
+; Function/macro definitions
 (function_definition
- name: (identifier) @definition.function) @local.scope
-(macro_definition 
- name: (identifier) @definition.macro) @local.scope
+  name: (identifier) @local.definition) @local.scope
+
+(short_function_definition
+  name: (identifier) @local.definition) @local.scope
+
+(macro_definition
+  name: (identifier) @local.definition) @local.scope
+
+; ----------
+; References
+; ----------
 
 (identifier) @local.reference
+ 
+; ------
+; Scopes
+; ------
 
 [
-  (try_statement)
-  (finally_clause)
-  (quote_statement)
-  (let_statement)
-  (compound_expression)
   (for_statement)
-] @local.scope
+  (while_statement)
+  (try_statement)
+  (catch_clause)
+  (finally_clause)
+  (let_statement)
+  (quote_statement)
+  (do_clause)
+] @local.scope 
+

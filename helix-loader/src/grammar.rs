@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::time::SystemTime;
@@ -8,6 +8,7 @@ use std::{
     process::Command,
     sync::mpsc::channel,
 };
+use tempfile::TempPath;
 use tree_sitter::Language;
 
 #[cfg(unix)]
@@ -67,9 +68,9 @@ pub fn get_language(name: &str) -> Result<Language> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn get_language(name: &str) -> Result<Language> {
     use libloading::{Library, Symbol};
-    let name = name.to_ascii_lowercase();
-    let mut library_path = crate::runtime_dir().join("grammars").join(&name);
-    library_path.set_extension(DYLIB_EXTENSION);
+    let mut rel_library_path = PathBuf::new().join("grammars").join(name);
+    rel_library_path.set_extension(DYLIB_EXTENSION);
+    let library_path = crate::runtime_file(&rel_library_path);
 
     let library = unsafe { Library::new(&library_path) }
         .with_context(|| format!("Error opening dynamic library {:?}", library_path))?;
@@ -84,16 +85,113 @@ pub fn get_language(name: &str) -> Result<Language> {
     Ok(language)
 }
 
+fn ensure_git_is_available() -> Result<()> {
+    helix_stdx::env::which("git")?;
+    Ok(())
+}
+
 pub fn fetch_grammars() -> Result<()> {
+    ensure_git_is_available()?;
+
     // We do not need to fetch local grammars.
     let mut grammars = get_grammar_configs()?;
     grammars.retain(|grammar| !matches!(grammar.source, GrammarSource::Local { .. }));
 
-    run_parallel(grammars, fetch_grammar, "fetch")
+    println!("Fetching {} grammars", grammars.len());
+    let results = run_parallel(grammars, fetch_grammar);
+
+    let mut errors = Vec::new();
+    let mut git_updated = Vec::new();
+    let mut git_up_to_date = 0;
+    let mut non_git = Vec::new();
+
+    for (grammar_id, res) in results {
+        match res {
+            Ok(FetchStatus::GitUpToDate) => git_up_to_date += 1,
+            Ok(FetchStatus::GitUpdated { revision }) => git_updated.push((grammar_id, revision)),
+            Ok(FetchStatus::NonGit) => non_git.push(grammar_id),
+            Err(e) => errors.push((grammar_id, e)),
+        }
+    }
+
+    non_git.sort_unstable();
+    git_updated.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    if git_up_to_date != 0 {
+        println!("{} up to date git grammars", git_up_to_date);
+    }
+
+    if !non_git.is_empty() {
+        println!("{} non git grammars", non_git.len());
+        println!("\t{:?}", non_git);
+    }
+
+    if !git_updated.is_empty() {
+        println!("{} updated grammars", git_updated.len());
+        // We checked the vec is not empty, unwrapping will not panic
+        let longest_id = git_updated.iter().map(|x| x.0.len()).max().unwrap();
+        for (id, rev) in git_updated {
+            println!(
+                "\t{id:width$} now on {rev}",
+                id = id,
+                width = longest_id,
+                rev = rev
+            );
+        }
+    }
+
+    if !errors.is_empty() {
+        let len = errors.len();
+        for (i, (grammar, error)) in errors.into_iter().enumerate() {
+            println!("Failure {}/{len}: {grammar} {error}", i + 1);
+        }
+        bail!("{len} grammars failed to fetch");
+    }
+
+    Ok(())
 }
 
-pub fn build_grammars() -> Result<()> {
-    run_parallel(get_grammar_configs()?, build_grammar, "build")
+pub fn build_grammars(target: Option<String>) -> Result<()> {
+    ensure_git_is_available()?;
+
+    let grammars = get_grammar_configs()?;
+    println!("Building {} grammars", grammars.len());
+    let results = run_parallel(grammars, move |grammar| {
+        build_grammar(grammar, target.as_deref())
+    });
+
+    let mut errors = Vec::new();
+    let mut already_built = 0;
+    let mut built = Vec::new();
+
+    for (grammar_id, res) in results {
+        match res {
+            Ok(BuildStatus::AlreadyBuilt) => already_built += 1,
+            Ok(BuildStatus::Built) => built.push(grammar_id),
+            Err(e) => errors.push((grammar_id, e)),
+        }
+    }
+
+    built.sort_unstable();
+
+    if already_built != 0 {
+        println!("{} grammars already built", already_built);
+    }
+
+    if !built.is_empty() {
+        println!("{} grammars built now", built.len());
+        println!("\t{:?}", built);
+    }
+
+    if !errors.is_empty() {
+        let len = errors.len();
+        for (i, (grammar_id, error)) in errors.into_iter().enumerate() {
+            println!("Failure {}/{len}: {grammar_id} {error}", i + 1);
+        }
+        bail!("{len} grammars failed to build");
+    }
+
+    Ok(())
 }
 
 // Returns the set of grammar configurations the user requests.
@@ -122,38 +220,44 @@ fn get_grammar_configs() -> Result<Vec<GrammarConfiguration>> {
     Ok(grammars)
 }
 
-fn run_parallel<F>(grammars: Vec<GrammarConfiguration>, job: F, action: &'static str) -> Result<()>
+fn run_parallel<F, Res>(grammars: Vec<GrammarConfiguration>, job: F) -> Vec<(String, Result<Res>)>
 where
-    F: Fn(GrammarConfiguration) -> Result<()> + std::marker::Send + 'static + Copy,
+    F: Fn(GrammarConfiguration) -> Result<Res> + Send + 'static + Clone,
+    Res: Send + 'static,
 {
     let pool = threadpool::Builder::new().build();
     let (tx, rx) = channel();
 
     for grammar in grammars {
         let tx = tx.clone();
+        let job = job.clone();
 
         pool.execute(move || {
             // Ignore any SendErrors, if any job in another thread has encountered an
             // error the Receiver will be closed causing this send to fail.
-            let _ = tx.send(job(grammar));
+            let _ = tx.send((grammar.grammar_id.clone(), job(grammar)));
         });
     }
 
     drop(tx);
 
-    // TODO: print all failures instead of the first one found.
-    rx.iter()
-        .find(|result| result.is_err())
-        .map(|err| err.with_context(|| format!("Failed to {} some grammar(s)", action)))
-        .unwrap_or(Ok(()))
+    rx.iter().collect()
 }
 
-fn fetch_grammar(grammar: GrammarConfiguration) -> Result<()> {
+enum FetchStatus {
+    GitUpToDate,
+    GitUpdated { revision: String },
+    NonGit,
+}
+
+fn fetch_grammar(grammar: GrammarConfiguration) -> Result<FetchStatus> {
     if let GrammarSource::Git {
         remote, revision, ..
     } = grammar.source
     {
-        let grammar_dir = crate::runtime_dir()
+        let grammar_dir = crate::runtime_dirs()
+            .first()
+            .expect("No runtime directories provided") // guaranteed by post-condition
             .join("grammars")
             .join("sources")
             .join(&grammar.grammar_id);
@@ -164,17 +268,17 @@ fn fetch_grammar(grammar: GrammarConfiguration) -> Result<()> {
         ))?;
 
         // create the grammar dir contains a git directory
-        if !grammar_dir.join(".git").is_dir() {
+        if !grammar_dir.join(".git").exists() {
             git(&grammar_dir, ["init"])?;
         }
 
         // ensure the remote matches the configured remote
-        if get_remote_url(&grammar_dir).map_or(true, |s| s != remote) {
+        if get_remote_url(&grammar_dir).as_ref() != Some(&remote) {
             set_remote(&grammar_dir, &remote)?;
         }
 
         // ensure the revision matches the configured revision
-        if get_revision(&grammar_dir).map_or(true, |s| s != revision) {
+        if get_revision(&grammar_dir).as_ref() != Some(&revision) {
             // Fetch the exact revision from the remote.
             // Supported by server-side git since v2.5.0 (July 2015),
             // enabled by default on major git hosts.
@@ -184,16 +288,13 @@ fn fetch_grammar(grammar: GrammarConfiguration) -> Result<()> {
             )?;
             git(&grammar_dir, ["checkout", &revision])?;
 
-            println!(
-                "Grammar '{}' checked out at '{}'.",
-                grammar.grammar_id, revision
-            );
+            Ok(FetchStatus::GitUpdated { revision })
         } else {
-            println!("Grammar '{}' is already up to date.", grammar.grammar_id);
+            Ok(FetchStatus::GitUpToDate)
         }
+    } else {
+        Ok(FetchStatus::NonGit)
     }
-
-    Ok(())
 }
 
 // Sets the remote for a repository to the given URL, creating the remote if
@@ -240,11 +341,18 @@ where
     }
 }
 
-fn build_grammar(grammar: GrammarConfiguration) -> Result<()> {
+enum BuildStatus {
+    AlreadyBuilt,
+    Built,
+}
+
+fn build_grammar(grammar: GrammarConfiguration, target: Option<&str>) -> Result<BuildStatus> {
     let grammar_dir = if let GrammarSource::Local { path } = &grammar.source {
         PathBuf::from(&path)
     } else {
-        crate::runtime_dir()
+        crate::runtime_dirs()
+            .first()
+            .expect("No runtime directories provided") // guaranteed by post-condition
             .join("grammars")
             .join("sources")
             .join(&grammar.grammar_id)
@@ -273,10 +381,14 @@ fn build_grammar(grammar: GrammarConfiguration) -> Result<()> {
     }
     .join("src");
 
-    build_tree_sitter_library(&path, grammar)
+    build_tree_sitter_library(&path, grammar, target)
 }
 
-fn build_tree_sitter_library(src_path: &Path, grammar: GrammarConfiguration) -> Result<()> {
+fn build_tree_sitter_library(
+    src_path: &Path,
+    grammar: GrammarConfiguration,
+    target: Option<&str>,
+) -> Result<BuildStatus> {
     let header_path = src_path;
     let parser_path = src_path.join("parser.c");
     let mut scanner_path = src_path.join("scanner.c");
@@ -291,19 +403,31 @@ fn build_tree_sitter_library(src_path: &Path, grammar: GrammarConfiguration) -> 
             None
         }
     };
-    let parser_lib_path = crate::runtime_dir().join("grammars");
+    let parser_lib_path = crate::runtime_dirs()
+        .first()
+        .expect("No runtime directories provided") // guaranteed by post-condition
+        .join("grammars");
     let mut library_path = parser_lib_path.join(&grammar.grammar_id);
     library_path.set_extension(DYLIB_EXTENSION);
 
-    let recompile = needs_recompile(&library_path, &parser_path, &scanner_path)
+    // if we are running inside a buildscript emit cargo metadata
+    // to detect if we are running from a buildscript check some env variables
+    // that cargo only sets for build scripts
+    if std::env::var("OUT_DIR").is_ok() && std::env::var("CARGO").is_ok() {
+        if let Some(scanner_path) = scanner_path.as_ref().and_then(|path| path.to_str()) {
+            println!("cargo:rerun-if-changed={scanner_path}");
+        }
+        if let Some(parser_path) = parser_path.to_str() {
+            println!("cargo:rerun-if-changed={parser_path}");
+        }
+    }
+
+    let recompile = needs_recompile(&library_path, &parser_path, scanner_path.as_ref())
         .context("Failed to compare source and binary timestamps")?;
 
     if !recompile {
-        println!("Grammar '{}' is already built.", grammar.grammar_id);
-        return Ok(());
+        return Ok(BuildStatus::AlreadyBuilt);
     }
-
-    println!("Building grammar '{}'", grammar.grammar_id);
 
     let mut config = cc::Build::new();
     config
@@ -311,7 +435,7 @@ fn build_tree_sitter_library(src_path: &Path, grammar: GrammarConfiguration) -> 
         .opt_level(3)
         .cargo_metadata(false)
         .host(BUILD_TARGET)
-        .target(BUILD_TARGET);
+        .target(target.unwrap_or(BUILD_TARGET));
     let compiler = config.get_compiler();
     let mut command = Command::new(compiler.path());
     command.current_dir(src_path);
@@ -319,14 +443,52 @@ fn build_tree_sitter_library(src_path: &Path, grammar: GrammarConfiguration) -> 
         command.env(key, value);
     }
 
-    if cfg!(windows) {
+    command.args(compiler.args());
+    // used to delay dropping the temporary object file until after the compilation is complete
+    let _path_guard;
+
+    if compiler.is_like_msvc() {
         command
-            .args(&["/nologo", "/LD", "/I"])
+            .args(["/nologo", "/LD", "/I"])
             .arg(header_path)
             .arg("/Od")
-            .arg("/utf-8");
+            .arg("/utf-8")
+            .arg("/std:c11");
         if let Some(scanner_path) = scanner_path.as_ref() {
-            command.arg(scanner_path);
+            if scanner_path.extension() == Some("c".as_ref()) {
+                command.arg(scanner_path);
+            } else {
+                let mut cpp_command = Command::new(compiler.path());
+                cpp_command.current_dir(src_path);
+                for (key, value) in compiler.env() {
+                    cpp_command.env(key, value);
+                }
+                cpp_command.args(compiler.args());
+                let object_file =
+                    library_path.with_file_name(format!("{}_scanner.obj", &grammar.grammar_id));
+                cpp_command
+                    .args(["/nologo", "/LD", "/I"])
+                    .arg(header_path)
+                    .arg("/Od")
+                    .arg("/utf-8")
+                    .arg("/std:c++14")
+                    .arg(format!("/Fo{}", object_file.display()))
+                    .arg("/c")
+                    .arg(scanner_path);
+                let output = cpp_command
+                    .output()
+                    .context("Failed to execute C++ compiler")?;
+
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "Parser compilation failed.\nStdout: {}\nStderr: {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                command.arg(&object_file);
+                _path_guard = TempPath::from_path(object_file);
+            }
         }
 
         command
@@ -338,20 +500,49 @@ fn build_tree_sitter_library(src_path: &Path, grammar: GrammarConfiguration) -> 
             .arg("-shared")
             .arg("-fPIC")
             .arg("-fno-exceptions")
-            .arg("-g")
             .arg("-I")
             .arg(header_path)
             .arg("-o")
-            .arg(&library_path)
-            .arg("-O3");
+            .arg(&library_path);
+
         if let Some(scanner_path) = scanner_path.as_ref() {
             if scanner_path.extension() == Some("c".as_ref()) {
-                command.arg("-xc").arg("-std=c99").arg(scanner_path);
+                command.arg("-xc").arg("-std=c11").arg(scanner_path);
             } else {
-                command.arg(scanner_path);
+                let mut cpp_command = Command::new(compiler.path());
+                cpp_command.current_dir(src_path);
+                for (key, value) in compiler.env() {
+                    cpp_command.env(key, value);
+                }
+                cpp_command.args(compiler.args());
+                let object_file =
+                    library_path.with_file_name(format!("{}_scanner.o", &grammar.grammar_id));
+                cpp_command
+                    .arg("-fPIC")
+                    .arg("-fno-exceptions")
+                    .arg("-I")
+                    .arg(header_path)
+                    .arg("-o")
+                    .arg(&object_file)
+                    .arg("-std=c++14")
+                    .arg("-c")
+                    .arg(scanner_path);
+                let output = cpp_command
+                    .output()
+                    .context("Failed to execute C++ compiler")?;
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "Parser compilation failed.\nStdout: {}\nStderr: {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+
+                command.arg(&object_file);
+                _path_guard = TempPath::from_path(object_file);
             }
         }
-        command.arg("-xc").arg(parser_path);
+        command.arg("-xc").arg("-std=c11").arg(parser_path);
         if cfg!(all(
             unix,
             not(any(target_os = "macos", target_os = "illumos"))
@@ -371,13 +562,13 @@ fn build_tree_sitter_library(src_path: &Path, grammar: GrammarConfiguration) -> 
         ));
     }
 
-    Ok(())
+    Ok(BuildStatus::Built)
 }
 
 fn needs_recompile(
     lib_path: &Path,
     parser_c_path: &Path,
-    scanner_path: &Option<PathBuf>,
+    scanner_path: Option<&PathBuf>,
 ) -> Result<bool> {
     if !lib_path.exists() {
         return Ok(true);
@@ -401,9 +592,6 @@ fn mtime(path: &Path) -> Result<SystemTime> {
 /// Gives the contents of a file from a language's `runtime/queries/<lang>`
 /// directory
 pub fn load_runtime_file(language: &str, filename: &str) -> Result<String, std::io::Error> {
-    let path = crate::RUNTIME_DIR
-        .join("queries")
-        .join(language)
-        .join(filename);
-    std::fs::read_to_string(&path)
+    let path = crate::runtime_file(&PathBuf::new().join("queries").join(language).join(filename));
+    std::fs::read_to_string(path)
 }

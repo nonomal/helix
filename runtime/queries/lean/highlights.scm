@@ -1,3 +1,8 @@
+; Variables
+(identifier) @variable
+
+; Namespaces
+
 (open
   namespace: (identifier) @namespace)
 (namespace
@@ -197,7 +202,7 @@
 (interpolated_string) @string
 ; (escape_sequence) @string.escape
 
-; Reset highlighing in string interpolation
+; Reset highlighting in string interpolation
 (interpolation) @none
 
 (interpolation
@@ -209,9 +214,3 @@
 ["|" "," "." ":" ";"] @punctuation.delimiter
 
 (sorry) @error
-
-;; Error
-(ERROR) @error
-
-; Variables
-(identifier) @variable

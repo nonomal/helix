@@ -214,34 +214,56 @@ impl Tree {
         node
     }
 
-    pub fn remove(&mut self, index: ViewId) {
-        let mut stack = Vec::new();
-
-        if self.focus == index {
-            // focus on something else
-            self.focus_next();
-        }
-
-        stack.push(index);
-
-        while let Some(index) = stack.pop() {
-            let parent_id = self.nodes[index].parent;
-            if let Node {
+    /// Get a mutable reference to a [Container] by index.
+    /// # Panics
+    /// Panics if `index` is not in self.nodes, or if the node's content is not a [Content::Container].
+    fn container_mut(&mut self, index: ViewId) -> &mut Container {
+        match &mut self.nodes[index] {
+            Node {
                 content: Content::Container(container),
                 ..
-            } = &mut self.nodes[parent_id]
-            {
-                if let Some(pos) = container.children.iter().position(|&child| child == index) {
-                    container.children.remove(pos);
+            } => container,
+            _ => unreachable!(),
+        }
+    }
 
-                    // TODO: if container now only has one child, remove it and place child in parent
-                    if container.children.is_empty() && parent_id != self.root {
-                        // if container now empty, remove it
-                        stack.push(parent_id);
-                    }
-                }
-            }
-            self.nodes.remove(index);
+    fn remove_or_replace(&mut self, child: ViewId, replacement: Option<ViewId>) {
+        let parent = self.nodes[child].parent;
+
+        self.nodes.remove(child);
+
+        let container = self.container_mut(parent);
+        let pos = container
+            .children
+            .iter()
+            .position(|&item| item == child)
+            .unwrap();
+
+        if let Some(new) = replacement {
+            container.children[pos] = new;
+            self.nodes[new].parent = parent;
+        } else {
+            container.children.remove(pos);
+        }
+    }
+
+    pub fn remove(&mut self, index: ViewId) {
+        if self.focus == index {
+            // focus on something else
+            self.focus = self.prev();
+        }
+
+        let parent = self.nodes[index].parent;
+        let parent_is_root = parent == self.root;
+
+        self.remove_or_replace(index, None);
+
+        let parent_container = self.container_mut(parent);
+        if parent_container.children.len() == 1 && !parent_is_root {
+            // Lets merge the only child back to its grandparent so that Views
+            // are equally spaced.
+            let sibling = parent_container.children.pop().unwrap();
+            self.remove_or_replace(parent, Some(sibling));
         }
 
         self.recalculate()
@@ -271,16 +293,31 @@ impl Tree {
             })
     }
 
+    /// Get reference to a [View] by index.
+    /// # Panics
+    ///
+    /// Panics if `index` is not in self.nodes, or if the node's content is not [Content::View]. This can be checked with [Self::contains].
     pub fn get(&self, index: ViewId) -> &View {
-        match &self.nodes[index] {
-            Node {
+        self.try_get(index).unwrap()
+    }
+
+    /// Try to get reference to a [View] by index. Returns `None` if node content is not a [`Content::View`].
+    ///
+    /// Does not panic if the view does not exists anymore.
+    pub fn try_get(&self, index: ViewId) -> Option<&View> {
+        match self.nodes.get(index) {
+            Some(Node {
                 content: Content::View(view),
                 ..
-            } => view,
-            _ => unreachable!(),
+            }) => Some(view),
+            _ => None,
         }
     }
 
+    /// Get a mutable reference to a [View] by index.
+    /// # Panics
+    ///
+    /// Panics if `index` is not in self.nodes, or if the node's content is not [Content::View]. This can be checked with [Self::contains].
     pub fn get_mut(&mut self, index: ViewId) -> &mut View {
         match &mut self.nodes[index] {
             Node {
@@ -289,6 +326,11 @@ impl Tree {
             } => view,
             _ => unreachable!(),
         }
+    }
+
+    /// Check if tree contains a [Node] with a given index.
+    pub fn contains(&self, index: ViewId) -> bool {
+        self.nodes.contains_key(index)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -365,11 +407,13 @@ impl Tree {
                         }
                         Layout::Vertical => {
                             let len = container.children.len();
-
-                            let width = area.width / len as u16;
+                            let len_u16 = len as u16;
 
                             let inner_gap = 1u16;
-                            // let total_gap = inner_gap * (len as u16 - 1);
+                            let total_gap = inner_gap * len_u16.saturating_sub(2);
+
+                            let used_area = area.width.saturating_sub(total_gap);
+                            let width = used_area / len_u16;
 
                             let mut child_x = area.x;
 
@@ -479,7 +523,7 @@ impl Tree {
                     // in a vertical container (and already correct based on previous search)
                     child_id = *container.children.iter().min_by_key(|id| {
                         let x = match &self.nodes[**id].content {
-                            Content::View(view) => view.inner_area().left(),
+                            Content::View(view) => view.area.left(),
                             Content::Container(container) => container.area.left(),
                         };
                         (current_x as i16 - x as i16).abs()
@@ -490,7 +534,7 @@ impl Tree {
                     // in a horizontal container (and already correct based on previous search)
                     child_id = *container.children.iter().min_by_key(|id| {
                         let y = match &self.nodes[**id].content {
-                            Content::View(view) => view.inner_area().top(),
+                            Content::View(view) => view.area.top(),
                             Content::Container(container) => container.area.top(),
                         };
                         (current_y as i16 - y as i16).abs()
@@ -501,13 +545,27 @@ impl Tree {
         Some(child_id)
     }
 
-    pub fn focus_direction(&mut self, direction: Direction) {
-        if let Some(id) = self.find_split_in_direction(self.focus, direction) {
-            self.focus = id;
+    pub fn prev(&self) -> ViewId {
+        // This function is very dumb, but that's because we don't store any parent links.
+        // (we'd be able to go parent.prev_sibling() recursively until we find something)
+        // For now that's okay though, since it's unlikely you'll be able to open a large enough
+        // number of splits to notice.
+
+        let mut views = self
+            .traverse()
+            .rev()
+            .skip_while(|&(id, _view)| id != self.focus)
+            .skip(1); // Skip focused value
+        if let Some((id, _)) = views.next() {
+            id
+        } else {
+            // extremely crude, take the last item
+            let (key, _) = self.traverse().next_back().unwrap();
+            key
         }
     }
 
-    pub fn focus_next(&mut self) {
+    pub fn next(&self) -> ViewId {
         // This function is very dumb, but that's because we don't store any parent links.
         // (we'd be able to go parent.next_sibling() recursively until we find something)
         // For now that's okay though, since it's unlikely you'll be able to open a large enough
@@ -518,11 +576,11 @@ impl Tree {
             .skip_while(|&(id, _view)| id != self.focus)
             .skip(1); // Skip focused value
         if let Some((id, _)) = views.next() {
-            self.focus = id;
+            id
         } else {
             // extremely crude, take the first item again
             let (key, _) = self.traverse().next().unwrap();
-            self.focus = key;
+            key
         }
     }
 
@@ -647,10 +705,27 @@ impl<'a> Iterator for Traverse<'a> {
     }
 }
 
+impl DoubleEndedIterator for Traverse<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            let key = self.stack.pop()?;
+
+            let node = &self.tree.nodes[key];
+
+            match &node.content {
+                Content::View(view) => return Some((key, view)),
+                Content::Container(container) => {
+                    self.stack.extend(container.children.iter());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::editor::GutterType;
+    use crate::editor::GutterConfig;
     use crate::DocumentId;
 
     #[test]
@@ -661,41 +736,28 @@ mod test {
             width: 180,
             height: 80,
         });
-        let mut view = View::new(
-            DocumentId::default(),
-            vec![GutterType::Diagnostics, GutterType::LineNumbers],
-        );
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
         view.area = Rect::new(0, 0, 180, 80);
         tree.insert(view);
 
         let l0 = tree.focus;
-        let view = View::new(
-            DocumentId::default(),
-            vec![GutterType::Diagnostics, GutterType::LineNumbers],
-        );
+        let view = View::new(DocumentId::default(), GutterConfig::default());
         tree.split(view, Layout::Vertical);
         let r0 = tree.focus;
 
         tree.focus = l0;
-        let view = View::new(
-            DocumentId::default(),
-            vec![GutterType::Diagnostics, GutterType::LineNumbers],
-        );
+        let view = View::new(DocumentId::default(), GutterConfig::default());
         tree.split(view, Layout::Horizontal);
         let l1 = tree.focus;
 
         tree.focus = l0;
-        let view = View::new(
-            DocumentId::default(),
-            vec![GutterType::Diagnostics, GutterType::LineNumbers],
-        );
+        let view = View::new(DocumentId::default(), GutterConfig::default());
         tree.split(view, Layout::Vertical);
-        let l2 = tree.focus;
 
         // Tree in test
         // | L0  | L2 |    |
         // |    L1    | R0 |
-        tree.focus = l2;
+        let l2 = tree.focus;
         assert_eq!(Some(l0), tree.find_split_in_direction(l2, Direction::Left));
         assert_eq!(Some(l1), tree.find_split_in_direction(l2, Direction::Down));
         assert_eq!(Some(r0), tree.find_split_in_direction(l2, Direction::Right));
@@ -730,40 +792,28 @@ mod test {
         });
 
         let doc_l0 = DocumentId::default();
-        let mut view = View::new(
-            doc_l0,
-            vec![GutterType::Diagnostics, GutterType::LineNumbers],
-        );
+        let mut view = View::new(doc_l0, GutterConfig::default());
         view.area = Rect::new(0, 0, 180, 80);
         tree.insert(view);
 
         let l0 = tree.focus;
 
         let doc_r0 = DocumentId::default();
-        let view = View::new(
-            doc_r0,
-            vec![GutterType::Diagnostics, GutterType::LineNumbers],
-        );
+        let view = View::new(doc_r0, GutterConfig::default());
         tree.split(view, Layout::Vertical);
         let r0 = tree.focus;
 
         tree.focus = l0;
 
         let doc_l1 = DocumentId::default();
-        let view = View::new(
-            doc_l1,
-            vec![GutterType::Diagnostics, GutterType::LineNumbers],
-        );
+        let view = View::new(doc_l1, GutterConfig::default());
         tree.split(view, Layout::Horizontal);
         let l1 = tree.focus;
 
         tree.focus = l0;
 
         let doc_l2 = DocumentId::default();
-        let view = View::new(
-            doc_l2,
-            vec![GutterType::Diagnostics, GutterType::LineNumbers],
-        );
+        let view = View::new(doc_l2, GutterConfig::default());
         tree.split(view, Layout::Vertical);
         let l2 = tree.focus;
 
@@ -847,5 +897,73 @@ mod test {
         assert_eq!(doc_id(&tree, l1), Some(doc_l1));
         assert_eq!(doc_id(&tree, l2), Some(doc_r0));
         assert_eq!(doc_id(&tree, r0), Some(doc_l0));
+    }
+
+    #[test]
+    fn all_vertical_views_have_same_width() {
+        let tree_area_width = 180;
+        let mut tree = Tree::new(Rect {
+            x: 0,
+            y: 0,
+            width: tree_area_width,
+            height: 80,
+        });
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
+        view.area = Rect::new(0, 0, 180, 80);
+        tree.insert(view);
+
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Vertical);
+
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Horizontal);
+
+        tree.remove(tree.focus);
+
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Vertical);
+
+        // Make sure that we only have one level in the tree.
+        assert_eq!(3, tree.views().count());
+        assert_eq!(
+            vec![
+                tree_area_width / 3 - 1, // gap here
+                tree_area_width / 3 - 1, // gap here
+                tree_area_width / 3
+            ],
+            tree.views()
+                .map(|(view, _)| view.area.width)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vsplit_gap_rounding() {
+        let (tree_area_width, tree_area_height) = (80, 24);
+        let mut tree = Tree::new(Rect {
+            x: 0,
+            y: 0,
+            width: tree_area_width,
+            height: tree_area_height,
+        });
+        let mut view = View::new(DocumentId::default(), GutterConfig::default());
+        view.area = Rect::new(0, 0, tree_area_width, tree_area_height);
+        tree.insert(view);
+
+        for _ in 0..9 {
+            let view = View::new(DocumentId::default(), GutterConfig::default());
+            tree.split(view, Layout::Vertical);
+        }
+
+        assert_eq!(10, tree.views().count());
+        assert_eq!(
+            std::iter::repeat(7)
+                .take(9)
+                .chain(Some(8)) // Rounding in `recalculate`.
+                .collect::<Vec<_>>(),
+            tree.views()
+                .map(|(view, _)| view.area.width)
+                .collect::<Vec<_>>()
+        );
     }
 }

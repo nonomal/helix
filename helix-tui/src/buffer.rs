@@ -3,14 +3,16 @@ use helix_core::unicode::width::UnicodeWidthStr;
 use std::cmp::min;
 use unicode_segmentation::UnicodeSegmentation;
 
-use helix_view::graphics::{Color, Modifier, Rect, Style};
+use helix_view::graphics::{Color, Modifier, Rect, Style, UnderlineStyle};
 
 /// A buffer cell
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub symbol: String,
     pub fg: Color,
     pub bg: Color,
+    pub underline_color: Color,
+    pub underline_style: UnderlineStyle,
     pub modifier: Modifier,
 }
 
@@ -44,6 +46,13 @@ impl Cell {
         if let Some(c) = style.bg {
             self.bg = c;
         }
+        if let Some(c) = style.underline_color {
+            self.underline_color = c;
+        }
+        if let Some(style) = style.underline_style {
+            self.underline_style = style;
+        }
+
         self.modifier.insert(style.add_modifier);
         self.modifier.remove(style.sub_modifier);
         self
@@ -53,6 +62,8 @@ impl Cell {
         Style::default()
             .fg(self.fg)
             .bg(self.bg)
+            .underline_color(self.underline_color)
+            .underline_style(self.underline_style)
             .add_modifier(self.modifier)
     }
 
@@ -61,6 +72,8 @@ impl Cell {
         self.symbol.push(' ');
         self.fg = Color::Reset;
         self.bg = Color::Reset;
+        self.underline_color = Color::Reset;
+        self.underline_style = UnderlineStyle::Reset;
         self.modifier = Modifier::empty();
     }
 }
@@ -71,6 +84,8 @@ impl Default for Cell {
             symbol: " ".into(),
             fg: Color::Reset,
             bg: Color::Reset,
+            underline_color: Color::Reset,
+            underline_style: UnderlineStyle::Reset,
             modifier: Modifier::empty(),
         }
     }
@@ -87,7 +102,7 @@ impl Default for Cell {
 ///
 /// ```
 /// use helix_tui::buffer::{Buffer, Cell};
-/// use helix_view::graphics::{Rect, Color, Style, Modifier};
+/// use helix_view::graphics::{Rect, Color, UnderlineStyle, Style, Modifier};
 ///
 /// let mut buf = Buffer::empty(Rect{x: 0, y: 0, width: 10, height: 5});
 /// buf[(0, 2)].set_symbol("x");
@@ -97,12 +112,14 @@ impl Default for Cell {
 ///     symbol: String::from("r"),
 ///     fg: Color::Red,
 ///     bg: Color::White,
-///     modifier: Modifier::empty()
+///     underline_color: Color::Reset,
+///     underline_style: UnderlineStyle::Reset,
+///     modifier: Modifier::empty(),
 /// });
 /// buf[(5, 0)].set_char('x');
 /// assert_eq!(buf[(5, 0)].symbol, "x");
 /// ```
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Buffer {
     /// The area represented by this buffer
     pub area: Rect,
@@ -113,22 +130,21 @@ pub struct Buffer {
 
 impl Buffer {
     /// Returns a Buffer with all cells set to the default one
+    #[must_use]
     pub fn empty(area: Rect) -> Buffer {
-        let cell: Cell = Default::default();
-        Buffer::filled(area, &cell)
+        Buffer::filled(area, &Cell::default())
     }
 
     /// Returns a Buffer with all cells initialized with the attributes of the given Cell
+    #[must_use]
     pub fn filled(area: Rect, cell: &Cell) -> Buffer {
-        let size = area.area() as usize;
-        let mut content = Vec::with_capacity(size);
-        for _ in 0..size {
-            content.push(cell.clone());
-        }
+        let size = area.area();
+        let content = vec![cell.clone(); size];
         Buffer { area, content }
     }
 
     /// Returns a Buffer containing the given lines
+    #[must_use]
     pub fn with_lines<S>(lines: Vec<S>) -> Buffer
     where
         S: AsRef<str>,
@@ -196,7 +212,7 @@ impl Buffer {
             && y < self.area.bottom()
     }
 
-    /// Returns the index in the Vec<Cell> for the given global (x, y) coordinates.
+    /// Returns the index in the `Vec<Cell>` for the given global (x, y) coordinates.
     ///
     /// Global coordinates are offset by the Buffer's area offset (`x`/`y`).
     ///
@@ -222,10 +238,10 @@ impl Buffer {
             y,
             self.area
         );
-        ((y - self.area.y) * self.area.width + (x - self.area.x)) as usize
+        ((y - self.area.y) as usize) * (self.area.width as usize) + ((x - self.area.x) as usize)
     }
 
-    /// Returns the index in the Vec<Cell> for the given global (x, y) coordinates,
+    /// Returns the index in the `Vec<Cell>` for the given global (x, y) coordinates,
     /// or `None` if the coordinates are outside the buffer's area.
     fn index_of_opt(&self, x: u16, y: u16) -> Option<usize> {
         if self.in_bounds(x, y) {
@@ -261,8 +277,8 @@ impl Buffer {
             self.content.len()
         );
         (
-            self.area.x + i as u16 % self.area.width,
-            self.area.y + i as u16 / self.area.width,
+            (self.area.x as usize + (i % self.area.width as usize)) as u16,
+            (self.area.y as usize + (i / self.area.width as usize)) as u16,
         )
     }
 
@@ -288,6 +304,68 @@ impl Buffer {
         S: AsRef<str>,
     {
         self.set_string_truncated_at_end(x, y, string.as_ref(), width, style)
+    }
+
+    /// Print at most the first `width` characters of a string if enough space is available
+    /// until the end of the line.
+    /// If `ellipsis` is true appends a `…` at the end of truncated lines.
+    /// If `truncate_start` is `true`, adds a `…` at the beginning of truncated lines.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_string_anchored(
+        &mut self,
+        x: u16,
+        y: u16,
+        truncate_start: bool,
+        truncate_end: bool,
+        string: &str,
+        width: usize,
+        style: impl Fn(usize) -> Style, // Map a grapheme's string offset to a style
+    ) -> (u16, u16) {
+        // prevent panic if out of range
+        if !self.in_bounds(x, y) || width == 0 {
+            return (x, y);
+        }
+
+        let max_offset = min(
+            self.area.right() as usize - 1,
+            width.saturating_add(x as usize),
+        );
+        let mut start_index = self.index_of(x, y);
+        let mut end_index = self.index_of(max_offset as u16, y);
+
+        if truncate_end {
+            self.content[end_index].set_symbol("…");
+            end_index -= 1;
+        }
+
+        if truncate_start {
+            self.content[start_index].set_symbol("…");
+            start_index += 1;
+        }
+
+        let graphemes = string.grapheme_indices(true);
+
+        for (byte_offset, s) in graphemes.skip(truncate_start as usize) {
+            if start_index > end_index {
+                break;
+            }
+            let width = s.width();
+            if width == 0 {
+                continue;
+            }
+
+            self.content[start_index].set_symbol(s);
+            self.content[start_index].set_style(style(byte_offset));
+
+            // Reset following cells if multi-width (they would be hidden by the grapheme):
+            for i in start_index + 1..start_index + width {
+                self.content[i].reset();
+            }
+
+            start_index += width;
+        }
+
+        (x, y)
     }
 
     /// Print at most the first `width` characters of a string if enough space is available
@@ -343,14 +421,14 @@ impl Buffer {
             let mut start_index = self.index_of(x, y);
             let mut index = self.index_of(max_offset as u16, y);
 
-            let total_width = string.width();
-            let truncated = total_width > width;
+            let content_width = string.width();
+            let truncated = content_width > width;
             if ellipsis && truncated {
                 self.content[start_index].set_symbol("…");
                 start_index += 1;
             }
             if !truncated {
-                index -= width - total_width;
+                index -= width - content_width;
             }
             for (byte_offset, s) in graphemes.rev() {
                 let width = s.width();
@@ -367,6 +445,7 @@ impl Buffer {
                     self.content[i].reset();
                 }
                 index -= width;
+                x_offset += width;
             }
         }
         (x_offset as u16, y)
@@ -415,7 +494,48 @@ impl Buffer {
         (x_offset as u16, y)
     }
 
-    pub fn set_spans<'a>(&mut self, x: u16, y: u16, spans: &Spans<'a>, width: u16) -> (u16, u16) {
+    pub fn set_spans_truncated(&mut self, x: u16, y: u16, spans: &Spans, width: u16) -> (u16, u16) {
+        // prevent panic if out of range
+        if !self.in_bounds(x, y) || width == 0 {
+            return (x, y);
+        }
+
+        let mut x_offset = x as usize;
+        let max_offset = min(self.area.right(), width.saturating_add(x));
+        let mut start_index = self.index_of(x, y);
+        let mut index = self.index_of(max_offset, y);
+
+        let content_width = spans.width();
+        let truncated = content_width > width as usize;
+        if truncated {
+            self.content[start_index].set_symbol("…");
+            start_index += 1;
+        } else {
+            index -= width as usize - content_width;
+        }
+        for span in spans.0.iter().rev() {
+            for s in span.content.graphemes(true).rev() {
+                let width = s.width();
+                if width == 0 {
+                    continue;
+                }
+                let start = index - width;
+                if start < start_index {
+                    break;
+                }
+                self.content[start].set_symbol(s);
+                self.content[start].set_style(span.style);
+                for i in start + 1..index {
+                    self.content[i].reset();
+                }
+                index -= width;
+                x_offset += width;
+            }
+        }
+        (x_offset as u16, y)
+    }
+
+    pub fn set_spans(&mut self, x: u16, y: u16, spans: &Spans, width: u16) -> (u16, u16) {
         let mut remaining_width = width;
         let mut x = x;
         for span in &spans.0 {
@@ -436,7 +556,7 @@ impl Buffer {
         (x, y)
     }
 
-    pub fn set_span<'a>(&mut self, x: u16, y: u16, span: &Span<'a>, width: u16) -> (u16, u16) {
+    pub fn set_span(&mut self, x: u16, y: u16, span: &Span, width: u16) -> (u16, u16) {
         self.set_stringn(x, y, span.content.as_ref(), width as usize, span.style)
     }
 
@@ -463,7 +583,7 @@ impl Buffer {
     /// Resize the buffer so that the mapped area matches the given area and that the buffer
     /// length is equal to area.width * area.height
     pub fn resize(&mut self, area: Rect) {
-        let length = area.area() as usize;
+        let length = area.area();
         if self.content.len() > length {
             self.content.truncate(length);
         } else {
@@ -503,10 +623,10 @@ impl Buffer {
     pub fn merge(&mut self, other: &Buffer) {
         let area = self.area.union(other.area);
         let cell: Cell = Default::default();
-        self.content.resize(area.area() as usize, cell.clone());
+        self.content.resize(area.area(), cell.clone());
 
         // Move original content to the appropriate space
-        let size = self.area.area() as usize;
+        let size = self.area.area();
         for i in (0..size).rev() {
             let (x, y) = self.pos_of(i);
             // New index in content
@@ -519,7 +639,7 @@ impl Buffer {
 
         // Push content of the other buffer into this one (may erase previous
         // data)
-        let size = other.area.area() as usize;
+        let size = other.area.area();
         for i in 0..size {
             let (x, y) = other.pos_of(i);
             // New index in content
@@ -570,8 +690,8 @@ impl Buffer {
         let mut to_skip: usize = 0;
         for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
             if (current != previous || invalidated > 0) && to_skip == 0 {
-                let x = i as u16 % width;
-                let y = i as u16 / width;
+                let x = (i % width as usize) as u16;
+                let y = (i / width as usize) as u16;
                 updates.push((x, y, &next_buffer[i]));
             }
 
@@ -676,13 +796,16 @@ mod tests {
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
 
+        // U+200B is the zero-width space codepoint
+        assert_eq!("\u{200B}".width(), 0);
+
         // Leading grapheme with zero width
-        let s = "\u{1}a";
+        let s = "\u{200B}a";
         buffer.set_stringn(0, 0, s, 1, Style::default());
         assert_eq!(buffer, Buffer::with_lines(vec!["a"]));
 
-        // Trailing grapheme with zero with
-        let s = "a\u{1}";
+        // Trailing grapheme with zero width
+        let s = "a\u{200B}";
         buffer.set_stringn(0, 0, s, 1, Style::default());
         assert_eq!(buffer, Buffer::with_lines(vec!["a"]));
     }

@@ -1,36 +1,47 @@
+mod tree_cursor;
+
 use crate::{
     auto_pairs::AutoPairs,
     chars::char_is_line_ending,
     diagnostic::Severity,
     regex::Regex,
     transaction::{ChangeSet, Operation},
-    Rope, RopeSlice, Tendril,
+    RopeSlice, Tendril,
 };
 
+use ahash::RandomState;
 use arc_swap::{ArcSwap, Guard};
+use bitflags::bitflags;
+use globset::GlobSet;
+use hashbrown::raw::RawTable;
+use helix_stdx::rope::{self, RopeSliceExt};
 use slotmap::{DefaultKey as LayerId, HopSlotMap};
 
 use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
-    fmt,
-    path::Path,
+    fmt::{self, Display, Write},
+    hash::{Hash, Hasher},
+    mem::replace,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
 
 use once_cell::sync::{Lazy, OnceCell};
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeSeq, Deserialize, Serialize};
 
 use helix_loader::grammar::{get_language, load_runtime_file};
 
-fn deserialize_regex<'de, D>(deserializer: D) -> Result<Option<Regex>, D::Error>
+pub use tree_cursor::TreeCursor;
+
+fn deserialize_regex<'de, D>(deserializer: D) -> Result<Option<rope::Regex>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     Option::<String>::deserialize(deserializer)?
-        .map(|buf| Regex::new(&buf).map_err(serde::de::Error::custom))
+        .map(|buf| rope::Regex::new(&buf).map_err(serde::de::Error::custom))
         .transpose()
 }
 
@@ -41,6 +52,21 @@ where
     Option::<toml::Value>::deserialize(deserializer)?
         .map(|toml| toml.try_into().map_err(serde::de::Error::custom))
         .transpose()
+}
+
+fn deserialize_tab_width<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    usize::deserialize(deserializer).and_then(|n| {
+        if n > 0 && n <= 16 {
+            Ok(n)
+        } else {
+            Err(serde::de::Error::custom(
+                "tab width must be a value from 1 to 16 inclusive",
+            ))
+        }
+    })
 }
 
 pub fn deserialize_auto_pairs<'de, D>(deserializer: D) -> Result<Option<AutoPairs>, D::Error>
@@ -55,8 +81,11 @@ fn default_timeout() -> u64 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Configuration {
     pub language: Vec<LanguageConfiguration>,
+    #[serde(default)]
+    pub language_server: HashMap<String, LanguageServerConfiguration>,
 }
 
 // largely based on tree-sitter/cli/src/loader.rs
@@ -64,20 +93,41 @@ pub struct Configuration {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct LanguageConfiguration {
     #[serde(rename = "name")]
-    pub language_id: String, // c-sharp, rust
-    pub scope: String,           // source.rust
-    pub file_types: Vec<String>, // filename ends_with? <Gemfile, rb, etc>
+    pub language_id: String, // c-sharp, rust, tsx
+    #[serde(rename = "language-id")]
+    // see the table under https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocumentItem
+    pub language_server_language_id: Option<String>, // csharp, rust, typescriptreact, for the language-server
+    pub scope: String,             // source.rust
+    pub file_types: Vec<FileType>, // filename extension or ends_with? <Gemfile, rb, etc>
     #[serde(default)]
     pub shebangs: Vec<String>, // interpreter(s) associated with language
-    pub roots: Vec<String>,      // these indicate project roots <.git, Cargo.toml>
-    pub comment_token: Option<String>,
-    pub max_line_length: Option<usize>,
-
-    #[serde(default, skip_serializing, deserialize_with = "deserialize_lsp_config")]
-    pub config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub roots: Vec<String>, // these indicate project roots <.git, Cargo.toml>
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "from_comment_tokens",
+        alias = "comment-token"
+    )]
+    pub comment_tokens: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "from_block_comment_tokens"
+    )]
+    pub block_comment_tokens: Option<Vec<BlockCommentToken>>,
+    pub text_width: Option<usize>,
+    pub soft_wrap: Option<SoftWrap>,
 
     #[serde(default)]
     pub auto_format: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formatter: Option<FormatterConfiguration>,
+
+    /// If set, overrides `editor.path-completion`.
+    pub path_completion: Option<bool>,
+
     #[serde(default)]
     pub diagnostic_severity: Severity,
 
@@ -85,14 +135,19 @@ pub struct LanguageConfiguration {
 
     // content_regex
     #[serde(default, skip_serializing, deserialize_with = "deserialize_regex")]
-    pub injection_regex: Option<Regex>,
+    pub injection_regex: Option<rope::Regex>,
     // first_line_regex
     //
     #[serde(skip)]
     pub(crate) highlight_config: OnceCell<Option<Arc<HighlightConfiguration>>>,
     // tags_config OnceCell<> https://github.com/tree-sitter/tree-sitter/pull/583
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language_server: Option<LanguageServerConfiguration>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_lang_features",
+        deserialize_with = "deserialize_lang_features"
+    )]
+    pub language_servers: Vec<LanguageServerFeatures>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indent: Option<IndentationConfiguration>,
 
@@ -111,6 +166,293 @@ pub struct LanguageConfiguration {
     pub auto_pairs: Option<AutoPairs>,
 
     pub rulers: Option<Vec<u16>>, // if set, override editor's rulers
+
+    /// Hardcoded LSP root directories relative to the workspace root, like `examples` or `tools/fuzz`.
+    /// Falling back to the current working directory if none are configured.
+    pub workspace_lsp_roots: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    pub persistent_diagnostic_sources: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum FileType {
+    /// The extension of the file, either the `Path::extension` or the full
+    /// filename if the file does not have an extension.
+    Extension(String),
+    /// A Unix-style path glob. This is compared to the file's absolute path, so
+    /// it can be used to detect files based on their directories. If the glob
+    /// is not an absolute path and does not already start with a glob pattern,
+    /// a glob pattern will be prepended to it.
+    Glob(globset::Glob),
+}
+
+impl Serialize for FileType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        match self {
+            FileType::Extension(extension) => serializer.serialize_str(extension),
+            FileType::Glob(glob) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("glob", glob.glob())?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FileType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct FileTypeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FileTypeVisitor {
+            type Value = FileType;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("string or table")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(FileType::Extension(value.to_string()))
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                match map.next_entry::<String, String>()? {
+                    Some((key, mut glob)) if key == "glob" => {
+                        // If the glob isn't an absolute path or already starts
+                        // with a glob pattern, add a leading glob so we
+                        // properly match relative paths.
+                        if !glob.starts_with('/') && !glob.starts_with("*/") {
+                            glob.insert_str(0, "*/");
+                        }
+
+                        globset::Glob::new(glob.as_str())
+                            .map(FileType::Glob)
+                            .map_err(|err| {
+                                serde::de::Error::custom(format!("invalid `glob` pattern: {}", err))
+                            })
+                    }
+                    Some((key, _value)) => Err(serde::de::Error::custom(format!(
+                        "unknown key in `file-types` list: {}",
+                        key
+                    ))),
+                    None => Err(serde::de::Error::custom(
+                        "expected a `suffix` key in the `file-types` entry",
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(FileTypeVisitor)
+    }
+}
+
+fn from_comment_tokens<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CommentTokens {
+        Multiple(Vec<String>),
+        Single(String),
+    }
+    Ok(
+        Option::<CommentTokens>::deserialize(deserializer)?.map(|tokens| match tokens {
+            CommentTokens::Single(val) => vec![val],
+            CommentTokens::Multiple(vals) => vals,
+        }),
+    )
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockCommentToken {
+    pub start: String,
+    pub end: String,
+}
+
+impl Default for BlockCommentToken {
+    fn default() -> Self {
+        BlockCommentToken {
+            start: "/*".to_string(),
+            end: "*/".to_string(),
+        }
+    }
+}
+
+fn from_block_comment_tokens<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<BlockCommentToken>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BlockCommentTokens {
+        Multiple(Vec<BlockCommentToken>),
+        Single(BlockCommentToken),
+    }
+    Ok(
+        Option::<BlockCommentTokens>::deserialize(deserializer)?.map(|tokens| match tokens {
+            BlockCommentTokens::Single(val) => vec![val],
+            BlockCommentTokens::Multiple(vals) => vals,
+        }),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum LanguageServerFeature {
+    Format,
+    GotoDeclaration,
+    GotoDefinition,
+    GotoTypeDefinition,
+    GotoReference,
+    GotoImplementation,
+    // Goto, use bitflags, combining previous Goto members?
+    SignatureHelp,
+    Hover,
+    DocumentHighlight,
+    Completion,
+    CodeAction,
+    WorkspaceCommand,
+    DocumentSymbols,
+    WorkspaceSymbols,
+    // Symbols, use bitflags, see above?
+    Diagnostics,
+    RenameSymbol,
+    InlayHints,
+}
+
+impl Display for LanguageServerFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use LanguageServerFeature::*;
+        let feature = match self {
+            Format => "format",
+            GotoDeclaration => "goto-declaration",
+            GotoDefinition => "goto-definition",
+            GotoTypeDefinition => "goto-type-definition",
+            GotoReference => "goto-reference",
+            GotoImplementation => "goto-implementation",
+            SignatureHelp => "signature-help",
+            Hover => "hover",
+            DocumentHighlight => "document-highlight",
+            Completion => "completion",
+            CodeAction => "code-action",
+            WorkspaceCommand => "workspace-command",
+            DocumentSymbols => "document-symbols",
+            WorkspaceSymbols => "workspace-symbols",
+            Diagnostics => "diagnostics",
+            RenameSymbol => "rename-symbol",
+            InlayHints => "inlay-hints",
+        };
+        write!(f, "{feature}",)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged, rename_all = "kebab-case", deny_unknown_fields)]
+enum LanguageServerFeatureConfiguration {
+    #[serde(rename_all = "kebab-case")]
+    Features {
+        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        only_features: HashSet<LanguageServerFeature>,
+        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        except_features: HashSet<LanguageServerFeature>,
+        name: String,
+    },
+    Simple(String),
+}
+
+#[derive(Debug, Default)]
+pub struct LanguageServerFeatures {
+    pub name: String,
+    pub only: HashSet<LanguageServerFeature>,
+    pub excluded: HashSet<LanguageServerFeature>,
+}
+
+impl LanguageServerFeatures {
+    pub fn has_feature(&self, feature: LanguageServerFeature) -> bool {
+        (self.only.is_empty() || self.only.contains(&feature)) && !self.excluded.contains(&feature)
+    }
+}
+
+fn deserialize_lang_features<'de, D>(
+    deserializer: D,
+) -> Result<Vec<LanguageServerFeatures>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<LanguageServerFeatureConfiguration> = Deserialize::deserialize(deserializer)?;
+    let res = raw
+        .into_iter()
+        .map(|config| match config {
+            LanguageServerFeatureConfiguration::Simple(name) => LanguageServerFeatures {
+                name,
+                ..Default::default()
+            },
+            LanguageServerFeatureConfiguration::Features {
+                only_features,
+                except_features,
+                name,
+            } => LanguageServerFeatures {
+                name,
+                only: only_features,
+                excluded: except_features,
+            },
+        })
+        .collect();
+    Ok(res)
+}
+fn serialize_lang_features<S>(
+    map: &Vec<LanguageServerFeatures>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut serializer = serializer.serialize_seq(Some(map.len()))?;
+    for features in map {
+        let features = if features.only.is_empty() && features.excluded.is_empty() {
+            LanguageServerFeatureConfiguration::Simple(features.name.to_owned())
+        } else {
+            LanguageServerFeatureConfiguration::Features {
+                only_features: features.only.clone(),
+                except_features: features.excluded.clone(),
+                name: features.name.to_owned(),
+            }
+        };
+        serializer.serialize_element(&features)?;
+    }
+    serializer.end()
+}
+
+fn deserialize_required_root_patterns<'de, D>(deserializer: D) -> Result<Option<GlobSet>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let patterns = Vec::<String>::deserialize(deserializer)?;
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = globset::Glob::new(&pattern).map_err(serde::de::Error::custom)?;
+        builder.add(glob);
+    }
+    builder.build().map(Some).map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,12 +462,30 @@ pub struct LanguageServerConfiguration {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub environment: HashMap<String, String>,
+    #[serde(default, skip_serializing, deserialize_with = "deserialize_lsp_config")]
+    pub config: Option<serde_json::Value>,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
-    pub language_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_required_root_patterns"
+    )]
+    pub required_root_patterns: Option<GlobSet>,
 }
 
-#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FormatterConfiguration {
+    pub command: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct AdvancedCompletion {
     pub name: Option<String>,
@@ -133,14 +493,14 @@ pub struct AdvancedCompletion {
     pub default: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", untagged)]
 pub enum DebugConfigCompletion {
     Named(String),
     Advanced(AdvancedCompletion),
 }
 
-#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum DebugArgumentValue {
     String(String),
@@ -148,16 +508,17 @@ pub enum DebugArgumentValue {
     Boolean(bool),
 }
 
-#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DebugTemplate {
     pub name: String,
     pub request: String,
+    #[serde(default)]
     pub completion: Vec<DebugConfigCompletion>,
     pub args: HashMap<String, DebugArgumentValue>,
 }
 
-#[derive(Debug, PartialEq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DebugAdapterConfig {
     pub name: String,
@@ -173,7 +534,7 @@ pub struct DebugAdapterConfig {
 }
 
 // Different workarounds for adapters' differences
-#[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct DebuggerQuirks {
     #[serde(default)]
     pub absolute_paths: bool,
@@ -182,12 +543,29 @@ pub struct DebuggerQuirks {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct IndentationConfiguration {
+    #[serde(deserialize_with = "deserialize_tab_width")]
     pub tab_width: usize,
     pub unit: String,
 }
 
+/// How the indentation for a newly inserted line should be determined.
+/// If the selected heuristic is not available (e.g. because the current
+/// language has no tree-sitter indent queries), a simpler one will be used.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndentationHeuristic {
+    /// Just copy the indentation of the line that the cursor is currently on.
+    Simple,
+    /// Use tree-sitter indent queries to compute the expected absolute indentation level of the new line.
+    TreeSitter,
+    /// Use tree-sitter indent queries to compute the expected difference in indentation between the new line
+    /// and the line before. Add this to the actual indentation level of the line before.
+    #[default]
+    Hybrid,
+}
+
 /// Configuration for auto pairs
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields, untagged)]
 pub enum AutoPairConfig {
     /// Enables or disables auto pairing. False means disabled. True means to use the default pairs.
@@ -241,7 +619,7 @@ pub enum CapturedNode<'a> {
     Grouped(Vec<Node<'a>>),
 }
 
-impl<'a> CapturedNode<'a> {
+impl CapturedNode<'_> {
     pub fn start_byte(&self) -> usize {
         match self {
             Self::Single(n) => n.start_byte(),
@@ -260,6 +638,26 @@ impl<'a> CapturedNode<'a> {
         self.start_byte()..self.end_byte()
     }
 }
+
+/// The maximum number of in-progress matches a TS cursor can consider at once.
+/// This is set to a constant in order to avoid performance problems for medium to large files. Set with `set_match_limit`.
+/// Using such a limit means that we lose valid captures, so there is fundamentally a tradeoff here.
+///
+///
+/// Old tree sitter versions used a limit of 32 by default until this limit was removed in version `0.19.5` (must now be set manually).
+/// However, this causes performance issues for medium to large files.
+/// In helix, this problem caused treesitter motions to take multiple seconds to complete in medium-sized rust files (3k loc).
+///
+///
+/// Neovim also encountered this problem and reintroduced this limit after it was removed upstream
+/// (see <https://github.com/neovim/neovim/issues/14897> and <https://github.com/neovim/neovim/pull/14915>).
+/// The number used here is fundamentally a tradeoff between breaking some obscure edge cases and performance.
+///
+///
+/// Neovim chose 64 for this value somewhat arbitrarily (<https://github.com/neovim/neovim/pull/18397>).
+/// 64 is too low for some languages though. In particular, it breaks some highlighting for record fields in Erlang record definitions.
+/// This number can be increased if new syntax highlight breakages are found, as long as the performance penalty is not too high.
+const TREE_SITTER_MATCH_LIMIT: u32 = 256;
 
 impl TextObjectQuery {
     /// Run the query on the given node and return sub nodes which match given
@@ -301,19 +699,15 @@ impl TextObjectQuery {
             .iter()
             .find_map(|cap| self.query.capture_index_for_name(cap))?;
 
+        cursor.set_match_limit(TREE_SITTER_MATCH_LIMIT);
+
         let nodes = cursor
             .captures(&self.query, node, RopeProvider(slice))
             .filter_map(move |(mat, _)| {
                 let nodes: Vec<_> = mat
                     .captures
                     .iter()
-                    .filter_map(|x| {
-                        if x.index == capture_idx {
-                            Some(x.node)
-                        } else {
-                            None
-                        }
-                    })
+                    .filter_map(|cap| (cap.index == capture_idx).then_some(cap.node))
                     .collect();
 
                 if nodes.len() > 1 {
@@ -327,53 +721,46 @@ impl TextObjectQuery {
     }
 }
 
-fn read_query(language: &str, filename: &str) -> String {
+pub fn read_query(language: &str, filename: &str) -> String {
     static INHERITS_REGEX: Lazy<Regex> =
         Lazy::new(|| Regex::new(r";+\s*inherits\s*:?\s*([a-z_,()-]+)\s*").unwrap());
 
     let query = load_runtime_file(language, filename).unwrap_or_default();
 
-    // TODO: the collect() is not ideal
-    let inherits = INHERITS_REGEX
-        .captures_iter(&query)
-        .flat_map(|captures| {
+    // replaces all "; inherits <language>(,<language>)*" with the queries of the given language(s)
+    INHERITS_REGEX
+        .replace_all(&query, |captures: &regex::Captures| {
             captures[1]
                 .split(',')
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
+                .fold(String::new(), |mut output, language| {
+                    // `write!` to a String cannot fail.
+                    write!(output, "\n{}\n", read_query(language, filename)).unwrap();
+                    output
+                })
         })
-        .collect::<Vec<_>>();
-
-    if inherits.is_empty() {
-        return query;
-    }
-
-    let mut queries = inherits
-        .iter()
-        .map(|language| read_query(language, filename))
-        .collect::<Vec<_>>();
-
-    queries.push(query);
-
-    queries.concat()
+        .to_string()
 }
 
 impl LanguageConfiguration {
     fn initialize_highlight(&self, scopes: &[String]) -> Option<Arc<HighlightConfiguration>> {
-        let language = self.language_id.to_ascii_lowercase();
-
-        let highlights_query = read_query(&language, "highlights.scm");
+        let highlights_query = read_query(&self.language_id, "highlights.scm");
         // always highlight syntax errors
         // highlights_query += "\n(ERROR) @error";
 
-        let injections_query = read_query(&language, "injections.scm");
-        let locals_query = read_query(&language, "locals.scm");
+        let injections_query = read_query(&self.language_id, "injections.scm");
+        let locals_query = read_query(&self.language_id, "locals.scm");
 
         if highlights_query.is_empty() {
             None
         } else {
             let language = get_language(self.grammar.as_deref().unwrap_or(&self.language_id))
-                .map_err(|e| log::info!("{}", e))
+                .map_err(|err| {
+                    log::error!(
+                        "Failed to load tree-sitter parser for language {:?}: {:#}",
+                        self.language_id,
+                        err
+                    )
+                })
                 .ok()?;
             let config = HighlightConfiguration::new(
                 language,
@@ -381,7 +768,8 @@ impl LanguageConfiguration {
                 &injections_query,
                 &locals_query,
             )
-            .unwrap_or_else(|query_error| panic!("Could not parse queries for language {:?}. Are your grammars out of sync? Try running 'hx --grammar fetch' and 'hx --grammar build'. This query could not be parsed: {:?}", self.language_id, query_error));
+            .map_err(|err| log::error!("Could not parse queries for language {:?}. Are your grammars out of sync? Try running 'hx --grammar fetch' and 'hx --grammar build'. This query could not be parsed: {:?}", self.language_id, err))
+            .ok()?;
 
             config.configure(scopes);
             Some(Arc::new(config))
@@ -406,34 +794,109 @@ impl LanguageConfiguration {
 
     pub fn indent_query(&self) -> Option<&Query> {
         self.indent_query
-            .get_or_init(|| {
-                let lang_name = self.language_id.to_ascii_lowercase();
-                let query_text = read_query(&lang_name, "indents.scm");
-                if query_text.is_empty() {
-                    return None;
-                }
-                let lang = self.highlight_config.get()?.as_ref()?.language;
-                Query::new(lang, &query_text).ok()
-            })
+            .get_or_init(|| self.load_query("indents.scm"))
             .as_ref()
     }
 
     pub fn textobject_query(&self) -> Option<&TextObjectQuery> {
         self.textobject_query
-            .get_or_init(|| -> Option<TextObjectQuery> {
-                let lang_name = self.language_id.to_ascii_lowercase();
-                let query_text = read_query(&lang_name, "textobjects.scm");
-                let lang = self.highlight_config.get()?.as_ref()?.language;
-                let query = Query::new(lang, &query_text)
-                    .map_err(|e| log::error!("Failed to parse textobjects.scm queries: {}", e))
-                    .ok()?;
-                Some(TextObjectQuery { query })
+            .get_or_init(|| {
+                self.load_query("textobjects.scm")
+                    .map(|query| TextObjectQuery { query })
             })
             .as_ref()
     }
 
     pub fn scope(&self) -> &str {
         &self.scope
+    }
+
+    fn load_query(&self, kind: &str) -> Option<Query> {
+        let query_text = read_query(&self.language_id, kind);
+        if query_text.is_empty() {
+            return None;
+        }
+        let lang = &self.highlight_config.get()?.as_ref()?.language;
+        Query::new(lang, &query_text)
+            .map_err(|e| {
+                log::error!(
+                    "Failed to parse {} queries for {}: {}",
+                    kind,
+                    self.language_id,
+                    e
+                )
+            })
+            .ok()
+    }
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SoftWrap {
+    /// Soft wrap lines that exceed viewport width. Default to off
+    // NOTE: Option on purpose because the struct is shared between language config and global config.
+    // By default the option is None so that the language config falls back to the global config unless explicitly set.
+    pub enable: Option<bool>,
+    /// Maximum space left free at the end of the line.
+    /// This space is used to wrap text at word boundaries. If that is not possible within this limit
+    /// the word is simply split at the end of the line.
+    ///
+    /// This is automatically hard-limited to a quarter of the viewport to ensure correct display on small views.
+    ///
+    /// Default to 20
+    pub max_wrap: Option<u16>,
+    /// Maximum number of indentation that can be carried over from the previous line when softwrapping.
+    /// If a line is indented further then this limit it is rendered at the start of the viewport instead.
+    ///
+    /// This is automatically hard-limited to a quarter of the viewport to ensure correct display on small views.
+    ///
+    /// Default to 40
+    pub max_indent_retain: Option<u16>,
+    /// Indicator placed at the beginning of softwrapped lines
+    ///
+    /// Defaults to ↪
+    pub wrap_indicator: Option<String>,
+    /// Softwrap at `text_width` instead of viewport width if it is shorter
+    pub wrap_at_text_width: Option<bool>,
+}
+
+#[derive(Debug)]
+struct FileTypeGlob {
+    glob: globset::Glob,
+    language_id: usize,
+}
+
+impl FileTypeGlob {
+    fn new(glob: globset::Glob, language_id: usize) -> Self {
+        Self { glob, language_id }
+    }
+}
+
+#[derive(Debug)]
+struct FileTypeGlobMatcher {
+    matcher: globset::GlobSet,
+    file_types: Vec<FileTypeGlob>,
+}
+
+impl FileTypeGlobMatcher {
+    fn new(file_types: Vec<FileTypeGlob>) -> Result<Self, globset::Error> {
+        let mut builder = globset::GlobSetBuilder::new();
+        for file_type in &file_types {
+            builder.add(file_type.glob.clone());
+        }
+
+        Ok(Self {
+            matcher: builder.build()?,
+            file_types,
+        })
+    }
+
+    fn language_id_for_path(&self, path: &Path) -> Option<&usize> {
+        self.matcher
+            .matches(path)
+            .iter()
+            .filter_map(|idx| self.file_types.get(*idx))
+            .max_by_key(|file_type| file_type.glob.glob().len())
+            .map(|file_type| &file_type.language_id)
     }
 }
 
@@ -443,54 +906,66 @@ impl LanguageConfiguration {
 pub struct Loader {
     // highlight_names ?
     language_configs: Vec<Arc<LanguageConfiguration>>,
-    language_config_ids_by_file_type: HashMap<String, usize>, // Vec<usize>
+    language_config_ids_by_extension: HashMap<String, usize>, // Vec<usize>
+    language_config_ids_glob_matcher: FileTypeGlobMatcher,
     language_config_ids_by_shebang: HashMap<String, usize>,
+
+    language_server_configs: HashMap<String, LanguageServerConfiguration>,
 
     scopes: ArcSwap<Vec<String>>,
 }
 
+pub type LoaderError = globset::Error;
+
 impl Loader {
-    pub fn new(config: Configuration) -> Self {
-        let mut loader = Self {
-            language_configs: Vec::new(),
-            language_config_ids_by_file_type: HashMap::new(),
-            language_config_ids_by_shebang: HashMap::new(),
-            scopes: ArcSwap::from_pointee(Vec::new()),
-        };
+    pub fn new(config: Configuration) -> Result<Self, LoaderError> {
+        let mut language_configs = Vec::new();
+        let mut language_config_ids_by_extension = HashMap::new();
+        let mut language_config_ids_by_shebang = HashMap::new();
+        let mut file_type_globs = Vec::new();
 
         for config in config.language {
             // get the next id
-            let language_id = loader.language_configs.len();
+            let language_id = language_configs.len();
 
             for file_type in &config.file_types {
                 // entry().or_insert(Vec::new).push(language_id);
-                loader
-                    .language_config_ids_by_file_type
-                    .insert(file_type.clone(), language_id);
+                match file_type {
+                    FileType::Extension(extension) => {
+                        language_config_ids_by_extension.insert(extension.clone(), language_id);
+                    }
+                    FileType::Glob(glob) => {
+                        file_type_globs.push(FileTypeGlob::new(glob.to_owned(), language_id));
+                    }
+                };
             }
             for shebang in &config.shebangs {
-                loader
-                    .language_config_ids_by_shebang
-                    .insert(shebang.clone(), language_id);
+                language_config_ids_by_shebang.insert(shebang.clone(), language_id);
             }
 
-            loader.language_configs.push(Arc::new(config));
+            language_configs.push(Arc::new(config));
         }
 
-        loader
+        Ok(Self {
+            language_configs,
+            language_config_ids_by_extension,
+            language_config_ids_glob_matcher: FileTypeGlobMatcher::new(file_type_globs)?,
+            language_config_ids_by_shebang,
+            language_server_configs: config.language_server,
+            scopes: ArcSwap::from_pointee(Vec::new()),
+        })
     }
 
     pub fn language_config_for_file_name(&self, path: &Path) -> Option<Arc<LanguageConfiguration>> {
         // Find all the language configurations that match this file name
         // or a suffix of the file name.
-        let configuration_id = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|file_name| self.language_config_ids_by_file_type.get(file_name))
+        let configuration_id = self
+            .language_config_ids_glob_matcher
+            .language_id_for_path(path)
             .or_else(|| {
                 path.extension()
                     .and_then(|extension| extension.to_str())
-                    .and_then(|extension| self.language_config_ids_by_file_type.get(extension))
+                    .and_then(|extension| self.language_config_ids_by_extension.get(extension))
             });
 
         configuration_id.and_then(|&id| self.language_configs.get(id).cloned())
@@ -498,11 +973,13 @@ impl Loader {
         // TODO: content_regex handling conflict resolution
     }
 
-    pub fn language_config_for_shebang(&self, source: &Rope) -> Option<Arc<LanguageConfiguration>> {
+    pub fn language_config_for_shebang(
+        &self,
+        source: RopeSlice,
+    ) -> Option<Arc<LanguageConfiguration>> {
         let line = Cow::from(source.line(0));
-        static SHEBANG_REGEX: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"^#!\s*(?:\S*[/\\](?:env\s+(?:\-\S+\s+)*)?)?([^\s\.\d]+)").unwrap()
-        });
+        static SHEBANG_REGEX: Lazy<Regex> =
+            Lazy::new(|| Regex::new(&["^", SHEBANG].concat()).unwrap());
         let configuration_id = SHEBANG_REGEX
             .captures(&line)
             .and_then(|cap| self.language_config_ids_by_shebang.get(&cap[1]));
@@ -517,22 +994,32 @@ impl Loader {
             .cloned()
     }
 
-    pub fn language_config_for_language_id(&self, id: &str) -> Option<Arc<LanguageConfiguration>> {
+    pub fn language_config_for_language_id(
+        &self,
+        id: impl PartialEq<String>,
+    ) -> Option<Arc<LanguageConfiguration>> {
         self.language_configs
             .iter()
-            .find(|config| config.language_id == id)
+            .find(|config| id.eq(&config.language_id))
             .cloned()
     }
 
-    pub fn language_configuration_for_injection_string(
-        &self,
-        string: &str,
-    ) -> Option<Arc<LanguageConfiguration>> {
+    /// Unlike `language_config_for_language_id`, which only returns Some for an exact id, this
+    /// function will perform a regex match on the given string to find the closest language match.
+    pub fn language_config_for_name(&self, slice: RopeSlice) -> Option<Arc<LanguageConfiguration>> {
+        // PERF: If the name matches up with the id, then this saves the need to do expensive regex.
+        let shortcircuit = self.language_config_for_language_id(slice);
+        if shortcircuit.is_some() {
+            return shortcircuit;
+        }
+
+        // If the name did not match up with a known id, then match on injection regex.
+
         let mut best_match_length = 0;
         let mut best_match_position = None;
         for (i, configuration) in self.language_configs.iter().enumerate() {
             if let Some(injection_regex) = &configuration.injection_regex {
-                if let Some(mat) = injection_regex.find(string) {
+                if let Some(mat) = injection_regex.find(slice.regex_input()) {
                     let length = mat.end() - mat.start();
                     if length > best_match_length {
                         best_match_position = Some(i);
@@ -542,15 +1029,35 @@ impl Loader {
             }
         }
 
-        if let Some(i) = best_match_position {
-            let configuration = &self.language_configs[i];
-            return Some(configuration.clone());
+        best_match_position.map(|i| self.language_configs[i].clone())
+    }
+
+    pub fn language_configuration_for_injection_string(
+        &self,
+        capture: &InjectionLanguageMarker,
+    ) -> Option<Arc<LanguageConfiguration>> {
+        match capture {
+            InjectionLanguageMarker::LanguageId(id) => self.language_config_for_language_id(*id),
+            InjectionLanguageMarker::Name(name) => self.language_config_for_name(*name),
+            InjectionLanguageMarker::Filename(file) => {
+                let path_str: Cow<str> = (*file).into();
+                self.language_config_for_file_name(Path::new(path_str.as_ref()))
+            }
+            InjectionLanguageMarker::Shebang(shebang) => {
+                let shebang_str: Cow<str> = (*shebang).into();
+                self.language_config_ids_by_shebang
+                    .get(shebang_str.as_ref())
+                    .and_then(|&id| self.language_configs.get(id).cloned())
+            }
         }
-        None
     }
 
     pub fn language_configs(&self) -> impl Iterator<Item = &Arc<LanguageConfiguration>> {
         self.language_configs.iter()
+    }
+
+    pub fn language_server_configs(&self) -> &HashMap<String, LanguageServerConfiguration> {
+        &self.language_server_configs
     }
 
     pub fn set_scopes(&self, scopes: Vec<String>) {
@@ -588,7 +1095,7 @@ thread_local! {
 pub struct Syntax {
     layers: HopSlotMap<LayerId, LanguageLayer>,
     root: LayerId,
-    loader: Arc<Loader>,
+    loader: Arc<ArcSwap<Loader>>,
 }
 
 fn byte_range_to_str(range: std::ops::Range<usize>, source: RopeSlice) -> Cow<str> {
@@ -596,17 +1103,23 @@ fn byte_range_to_str(range: std::ops::Range<usize>, source: RopeSlice) -> Cow<st
 }
 
 impl Syntax {
-    pub fn new(source: &Rope, config: Arc<HighlightConfiguration>, loader: Arc<Loader>) -> Self {
+    pub fn new(
+        source: RopeSlice,
+        config: Arc<HighlightConfiguration>,
+        loader: Arc<ArcSwap<Loader>>,
+    ) -> Option<Self> {
         let root_layer = LanguageLayer {
             tree: None,
             config,
             depth: 0,
+            flags: LayerUpdateFlags::empty(),
             ranges: vec![Range {
                 start_byte: 0,
                 end_byte: usize::MAX,
                 start_point: Point::new(0, 0),
                 end_point: Point::new(usize::MAX, usize::MAX),
             }],
+            parent: None,
         };
 
         // track scope_descriptor: a Vec of scopes for item in tree
@@ -620,25 +1133,28 @@ impl Syntax {
             loader,
         };
 
-        syntax
-            .update(source, source, &ChangeSet::new(source))
-            .unwrap();
+        let res = syntax.update(source, source, &ChangeSet::new(source));
 
-        syntax
+        if res.is_err() {
+            log::error!("TS parser failed, disabling TS for the current buffer: {res:?}");
+            return None;
+        }
+        Some(syntax)
     }
 
     pub fn update(
         &mut self,
-        old_source: &Rope,
-        source: &Rope,
+        old_source: RopeSlice,
+        source: RopeSlice,
         changeset: &ChangeSet,
     ) -> Result<(), Error> {
         let mut queue = VecDeque::new();
         queue.push_back(self.root);
 
-        let scopes = self.loader.scopes.load();
-        let injection_callback = |language: &str| {
-            self.loader
+        let loader = self.loader.load();
+        let scopes = loader.scopes.load();
+        let injection_callback = |language: &InjectionLanguageMarker| {
+            loader
                 .language_configuration_for_injection_string(language)
                 .and_then(|language_config| language_config.highlight_config(&scopes))
         };
@@ -646,29 +1162,38 @@ impl Syntax {
         // Convert the changeset into tree sitter edits.
         let edits = generate_edits(old_source, changeset);
 
+        // This table allows inverse indexing of `layers`.
+        // That is by hashing a `Layer` you can find
+        // the `LayerId` of an existing equivalent `Layer` in `layers`.
+        //
+        // It is used to determine if a new layer exists for an injection
+        // or if an existing layer needs to be updated.
+        let mut layers_table = RawTable::with_capacity(self.layers.len());
+        let layers_hasher = RandomState::new();
         // Use the edits to update all layers markers
-        if !edits.is_empty() {
-            fn point_add(a: Point, b: Point) -> Point {
-                if b.row > 0 {
-                    Point::new(a.row.saturating_add(b.row), b.column)
-                } else {
-                    Point::new(0, a.column.saturating_add(b.column))
-                }
+        fn point_add(a: Point, b: Point) -> Point {
+            if b.row > 0 {
+                Point::new(a.row.saturating_add(b.row), b.column)
+            } else {
+                Point::new(0, a.column.saturating_add(b.column))
             }
-            fn point_sub(a: Point, b: Point) -> Point {
-                if a.row > b.row {
-                    Point::new(a.row.saturating_sub(b.row), a.column)
-                } else {
-                    Point::new(0, a.column.saturating_sub(b.column))
-                }
+        }
+        fn point_sub(a: Point, b: Point) -> Point {
+            if a.row > b.row {
+                Point::new(a.row.saturating_sub(b.row), a.column)
+            } else {
+                Point::new(0, a.column.saturating_sub(b.column))
+            }
+        }
+
+        for (layer_id, layer) in self.layers.iter_mut() {
+            // The root layer always covers the whole range (0..usize::MAX)
+            if layer.depth == 0 {
+                layer.flags = LayerUpdateFlags::MODIFIED;
+                continue;
             }
 
-            for layer in &mut self.layers.values_mut() {
-                // The root layer always covers the whole range (0..usize::MAX)
-                if layer.depth == 0 {
-                    continue;
-                }
-
+            if !edits.is_empty() {
                 for range in &mut layer.ranges {
                     // Roughly based on https://github.com/tree-sitter/tree-sitter/blob/ddeaa0c7f534268b35b4f6cb39b52df082754413/lib/src/subtree.c#L691-L720
                     for edit in edits.iter().rev() {
@@ -696,6 +1221,8 @@ impl Syntax {
                                 edit.new_end_position,
                                 point_sub(range.end_point, edit.old_end_position),
                             );
+
+                            layer.flags |= LayerUpdateFlags::MOVED;
                         }
                         // if the edit starts in the space before and extends into the range
                         else if edit.start_byte < range.start_byte {
@@ -710,11 +1237,13 @@ impl Syntax {
                                 edit.new_end_position,
                                 point_sub(range.end_point, edit.old_end_position),
                             );
+                            layer.flags = LayerUpdateFlags::MODIFIED;
                         }
                         // If the edit is an insertion at the start of the tree, shift
                         else if edit.start_byte == range.start_byte && is_pure_insertion {
                             range.start_byte = edit.new_end_byte;
                             range.start_point = edit.new_end_position;
+                            layer.flags |= LayerUpdateFlags::MOVED;
                         } else {
                             range.end_byte = range
                                 .end_byte
@@ -724,41 +1253,56 @@ impl Syntax {
                                 edit.new_end_position,
                                 point_sub(range.end_point, edit.old_end_position),
                             );
+                            layer.flags = LayerUpdateFlags::MODIFIED;
                         }
                     }
                 }
             }
+
+            let hash = layers_hasher.hash_one(layer);
+            // Safety: insert_no_grow is unsafe because it assumes that the table
+            // has enough capacity to hold additional elements.
+            // This is always the case as we reserved enough capacity above.
+            unsafe { layers_table.insert_no_grow(hash, layer_id) };
         }
 
         PARSER.with(|ts_parser| {
             let ts_parser = &mut ts_parser.borrow_mut();
-            let mut cursor = ts_parser.cursors.pop().unwrap_or_else(QueryCursor::new);
+            ts_parser.parser.set_timeout_micros(1000 * 500); // half a second is pretty generours
+            let mut cursor = ts_parser.cursors.pop().unwrap_or_default();
             // TODO: might need to set cursor range
             cursor.set_byte_range(0..usize::MAX);
+            cursor.set_match_limit(TREE_SITTER_MATCH_LIMIT);
 
             let source_slice = source.slice(..);
 
-            let mut touched = HashSet::new();
-
-            // TODO: we should be able to avoid editing & parsing layers with ranges earlier in the document before the edit
-
             while let Some(layer_id) = queue.pop_front() {
-                // Mark the layer as touched
-                touched.insert(layer_id);
-
                 let layer = &mut self.layers[layer_id];
+
+                // Mark the layer as touched
+                layer.flags |= LayerUpdateFlags::TOUCHED;
 
                 // If a tree already exists, notify it of changes.
                 if let Some(tree) = &mut layer.tree {
-                    for edit in edits.iter().rev() {
-                        // Apply the edits in reverse.
-                        // If we applied them in order then edit 1 would disrupt the positioning of edit 2.
-                        tree.edit(edit);
+                    if layer
+                        .flags
+                        .intersects(LayerUpdateFlags::MODIFIED | LayerUpdateFlags::MOVED)
+                    {
+                        for edit in edits.iter().rev() {
+                            // Apply the edits in reverse.
+                            // If we applied them in order then edit 1 would disrupt the positioning of edit 2.
+                            tree.edit(edit);
+                        }
                     }
-                }
 
-                // Re-parse the tree.
-                layer.parse(&mut ts_parser.parser, source)?;
+                    if layer.flags.contains(LayerUpdateFlags::MODIFIED) {
+                        // Re-parse the tree.
+                        layer.parse(&mut ts_parser.parser, source)?;
+                    }
+                } else {
+                    // always parse if this layer has never been parsed before
+                    layer.parse(&mut ts_parser.parser, source)?;
+                }
 
                 // Switch to an immutable borrow.
                 let layer = &self.layers[layer_id];
@@ -769,14 +1313,37 @@ impl Syntax {
                     layer.tree().root_node(),
                     RopeProvider(source_slice),
                 );
+                let mut combined_injections = vec![
+                    (None, Vec::new(), IncludedChildren::default());
+                    layer.config.combined_injections_patterns.len()
+                ];
                 let mut injections = Vec::new();
+                let mut last_injection_end = 0;
                 for mat in matches {
-                    let (language_name, content_node, include_children) = injection_for_match(
-                        &layer.config,
-                        &layer.config.injections_query,
-                        &mat,
-                        source_slice,
-                    );
+                    let (injection_capture, content_node, included_children) = layer
+                        .config
+                        .injection_for_match(&layer.config.injections_query, &mat, source_slice);
+
+                    // in case this is a combined injection save it for more processing later
+                    if let Some(combined_injection_idx) = layer
+                        .config
+                        .combined_injections_patterns
+                        .iter()
+                        .position(|&pattern| pattern == mat.pattern_index)
+                    {
+                        let entry = &mut combined_injections[combined_injection_idx];
+                        if injection_capture.is_some() {
+                            entry.0 = injection_capture;
+                        }
+                        if let Some(content_node) = content_node {
+                            if content_node.start_byte() >= last_injection_end {
+                                entry.1.push(content_node);
+                                last_injection_end = content_node.end_byte();
+                            }
+                        }
+                        entry.2 = included_children;
+                        continue;
+                    }
 
                     // Explicitly remove this match so that none of its other captures will remain
                     // in the stream of captures.
@@ -784,56 +1351,31 @@ impl Syntax {
 
                     // If a language is found with the given name, then add a new language layer
                     // to the highlighted document.
-                    if let (Some(language_name), Some(content_node)) = (language_name, content_node)
+                    if let (Some(injection_capture), Some(content_node)) =
+                        (injection_capture, content_node)
                     {
-                        if let Some(config) = (injection_callback)(&language_name) {
+                        if let Some(config) = (injection_callback)(&injection_capture) {
                             let ranges =
-                                intersect_ranges(&layer.ranges, &[content_node], include_children);
+                                intersect_ranges(&layer.ranges, &[content_node], included_children);
 
                             if !ranges.is_empty() {
+                                if content_node.start_byte() < last_injection_end {
+                                    continue;
+                                }
+                                last_injection_end = content_node.end_byte();
                                 injections.push((config, ranges));
                             }
                         }
                     }
                 }
 
-                // Process combined injections.
-                if let Some(combined_injections_query) = &layer.config.combined_injections_query {
-                    let mut injections_by_pattern_index =
-                        vec![(None, Vec::new(), false); combined_injections_query.pattern_count()];
-                    let matches = cursor.matches(
-                        combined_injections_query,
-                        layer.tree().root_node(),
-                        RopeProvider(source_slice),
-                    );
-                    for mat in matches {
-                        let entry = &mut injections_by_pattern_index[mat.pattern_index];
-                        let (language_name, content_node, include_children) = injection_for_match(
-                            &layer.config,
-                            combined_injections_query,
-                            &mat,
-                            source_slice,
-                        );
-                        if language_name.is_some() {
-                            entry.0 = language_name;
-                        }
-                        if let Some(content_node) = content_node {
-                            entry.1.push(content_node);
-                        }
-                        entry.2 = include_children;
-                    }
-                    for (lang_name, content_nodes, includes_children) in injections_by_pattern_index
-                    {
-                        if let (Some(lang_name), false) = (lang_name, content_nodes.is_empty()) {
-                            if let Some(config) = (injection_callback)(&lang_name) {
-                                let ranges = intersect_ranges(
-                                    &layer.ranges,
-                                    &content_nodes,
-                                    includes_children,
-                                );
-                                if !ranges.is_empty() {
-                                    injections.push((config, ranges));
-                                }
+                for (lang_name, content_nodes, included_children) in combined_injections {
+                    if let (Some(lang_name), false) = (lang_name, content_nodes.is_empty()) {
+                        if let Some(config) = (injection_callback)(&lang_name) {
+                            let ranges =
+                                intersect_ranges(&layer.ranges, &content_nodes, included_children);
+                            if !ranges.is_empty() {
+                                injections.push((config, ranges));
                             }
                         }
                     }
@@ -842,25 +1384,26 @@ impl Syntax {
                 let depth = layer.depth + 1;
                 // TODO: can't inline this since matches borrows self.layers
                 for (config, ranges) in injections {
-                    // Find an existing layer
-                    let layer = self
-                        .layers
-                        .iter_mut()
-                        .find(|(_, layer)| {
-                            layer.depth == depth && // TODO: track parent id instead
-                            layer.config.language == config.language && layer.ranges == ranges
+                    let parent = Some(layer_id);
+                    let new_layer = LanguageLayer {
+                        tree: None,
+                        config,
+                        depth,
+                        ranges,
+                        flags: LayerUpdateFlags::empty(),
+                        parent: None,
+                    };
+
+                    // Find an identical existing layer
+                    let layer = layers_table
+                        .get(layers_hasher.hash_one(&new_layer), |&it| {
+                            self.layers[it] == new_layer
                         })
-                        .map(|(id, _layer)| id);
+                        .copied();
 
                     // ...or insert a new one.
-                    let layer_id = layer.unwrap_or_else(|| {
-                        self.layers.insert(LanguageLayer {
-                            tree: None,
-                            config,
-                            depth,
-                            ranges,
-                        })
-                    });
+                    let layer_id = layer.unwrap_or_else(|| self.layers.insert(new_layer));
+                    self.layers[layer_id].parent = parent;
 
                     queue.push_back(layer_id);
                 }
@@ -872,8 +1415,11 @@ impl Syntax {
             // Return the cursor back in the pool.
             ts_parser.cursors.push(cursor);
 
-            // Remove all untouched layers
-            self.layers.retain(|id, _| touched.contains(&id));
+            // Reset all `LayerUpdateFlags` and remove all untouched layers
+            self.layers.retain(|_, layer| {
+                replace(&mut layer.flags, LayerUpdateFlags::empty())
+                    .contains(LayerUpdateFlags::TOUCHED)
+            });
 
             Ok(())
         })
@@ -899,17 +1445,21 @@ impl Syntax {
                 // Reuse a cursor from the pool if available.
                 let mut cursor = PARSER.with(|ts_parser| {
                     let highlighter = &mut ts_parser.borrow_mut();
-                    highlighter.cursors.pop().unwrap_or_else(QueryCursor::new)
+                    highlighter.cursors.pop().unwrap_or_default()
                 });
 
                 // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
                 // prevents them from being moved. But both of these values are really just
                 // pointers, so it's actually ok to move them.
-                let cursor_ref =
-                    unsafe { mem::transmute::<_, &'static mut QueryCursor>(&mut cursor) };
+                let cursor_ref = unsafe {
+                    mem::transmute::<&mut tree_sitter::QueryCursor, &mut tree_sitter::QueryCursor>(
+                        &mut cursor,
+                    )
+                };
 
                 // if reusing cursors & no range this resets to whole range
                 cursor_ref.set_byte_range(range.clone().unwrap_or(0..usize::MAX));
+                cursor_ref.set_match_limit(TREE_SITTER_MATCH_LIMIT);
 
                 let mut captures = cursor_ref
                     .captures(
@@ -931,21 +1481,14 @@ impl Syntax {
                     }],
                     cursor,
                     _tree: None,
-                    captures,
+                    captures: RefCell::new(captures),
                     config: layer.config.as_ref(), // TODO: just reuse `layer`
                     depth: layer.depth,            // TODO: just reuse `layer`
-                    ranges: &layer.ranges,         // TODO: temp
                 })
             })
             .collect::<Vec<_>>();
 
-        // HAXX: arrange layers by byte range, with deeper layers positioned first
-        layers.sort_by_key(|layer| {
-            (
-                layer.ranges.first().cloned(),
-                std::cmp::Reverse(layer.depth),
-            )
-        });
+        layers.sort_unstable_by_key(|layer| layer.sort_key());
 
         let mut result = HighlightIter {
             source,
@@ -960,6 +1503,38 @@ impl Syntax {
         result
     }
 
+    pub fn tree_for_byte_range(&self, start: usize, end: usize) -> &Tree {
+        let mut container_id = self.root;
+
+        for (layer_id, layer) in self.layers.iter() {
+            if layer.depth > self.layers[container_id].depth
+                && layer.contains_byte_range(start, end)
+            {
+                container_id = layer_id;
+            }
+        }
+
+        self.layers[container_id].tree()
+    }
+
+    pub fn named_descendant_for_byte_range(&self, start: usize, end: usize) -> Option<Node<'_>> {
+        self.tree_for_byte_range(start, end)
+            .root_node()
+            .named_descendant_for_byte_range(start, end)
+    }
+
+    pub fn descendant_for_byte_range(&self, start: usize, end: usize) -> Option<Node<'_>> {
+        self.tree_for_byte_range(start, end)
+            .root_node()
+            .descendant_for_byte_range(start, end)
+    }
+
+    pub fn walk(&self) -> TreeCursor<'_> {
+        // data structure to find the smallest range that contains a point
+        // when some of the ranges in the structure can overlap.
+        TreeCursor::new(&self.layers, self.root)
+    }
+
     // Commenting
     // comment_strings_for_pos
     // is_commented
@@ -972,6 +1547,17 @@ impl Syntax {
     // TODO: Folding
 }
 
+bitflags! {
+    /// Flags that track the status of a layer
+    /// in the `Sytaxn::update` function
+    #[derive(Debug)]
+    struct LayerUpdateFlags : u32{
+        const MODIFIED = 0b001;
+        const MOVED = 0b010;
+        const TOUCHED = 0b100;
+    }
+}
+
 #[derive(Debug)]
 pub struct LanguageLayer {
     // mode
@@ -979,7 +1565,31 @@ pub struct LanguageLayer {
     pub config: Arc<HighlightConfiguration>,
     pub(crate) tree: Option<Tree>,
     pub ranges: Vec<Range>,
-    pub depth: usize,
+    pub depth: u32,
+    flags: LayerUpdateFlags,
+    parent: Option<LayerId>,
+}
+
+/// This PartialEq implementation only checks if that
+/// two layers are theoretically identical (meaning they highlight the same text range with the same language).
+/// It does not check whether the layers have the same internal treesitter
+/// state.
+impl PartialEq for LanguageLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.depth == other.depth
+            && self.config.language == other.config.language
+            && self.ranges == other.ranges
+    }
+}
+
+/// Hash implementation belongs to PartialEq implementation above.
+/// See its documentation for details.
+impl Hash for LanguageLayer {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.depth.hash(state);
+        self.config.language.hash(state);
+        self.ranges.hash(state);
+    }
 }
 
 impl LanguageLayer {
@@ -988,11 +1598,13 @@ impl LanguageLayer {
         self.tree.as_ref().unwrap()
     }
 
-    fn parse(&mut self, parser: &mut Parser, source: &Rope) -> Result<(), Error> {
-        parser.set_included_ranges(&self.ranges).unwrap();
+    fn parse(&mut self, parser: &mut Parser, source: RopeSlice) -> Result<(), Error> {
+        parser
+            .set_included_ranges(&self.ranges)
+            .map_err(|_| Error::InvalidRanges)?;
 
         parser
-            .set_language(self.config.language)
+            .set_language(&self.config.language)
             .map_err(|_| Error::InvalidLanguage)?;
 
         // unsafe { syntax.parser.set_cancellation_flag(cancellation_flag) };
@@ -1001,7 +1613,7 @@ impl LanguageLayer {
                 &mut |byte, _| {
                     if byte <= source.len_bytes() {
                         let (chunk, start_byte, _, _) = source.chunk_at_byte(byte);
-                        chunk[byte - start_byte..].as_bytes()
+                        &chunk.as_bytes()[byte - start_byte..]
                     } else {
                         // out of range
                         &[]
@@ -1014,10 +1626,36 @@ impl LanguageLayer {
         self.tree = Some(tree);
         Ok(())
     }
+
+    /// Whether the layer contains the given byte range.
+    ///
+    /// If the layer has multiple ranges (i.e. combined injections), the
+    /// given range is considered contained if it is within the start and
+    /// end bytes of the first and last ranges **and** if the given range
+    /// starts or ends within any of the layer's ranges.
+    fn contains_byte_range(&self, start: usize, end: usize) -> bool {
+        let layer_start = self
+            .ranges
+            .first()
+            .expect("ranges should not be empty")
+            .start_byte;
+        let layer_end = self
+            .ranges
+            .last()
+            .expect("ranges should not be empty")
+            .end_byte;
+
+        layer_start <= start
+            && layer_end >= end
+            && self.ranges.iter().any(|range| {
+                let byte_range = range.start_byte..range.end_byte;
+                byte_range.contains(&start) || byte_range.contains(&end)
+            })
+    }
 }
 
 pub(crate) fn generate_edits(
-    old_text: &Rope,
+    old_text: RopeSlice,
     changeset: &ChangeSet,
 ) -> Vec<tree_sitter::InputEdit> {
     use Operation::*;
@@ -1033,7 +1671,7 @@ pub(crate) fn generate_edits(
 
     // TODO; this is a lot easier with Change instead of Operation.
 
-    fn point_at_pos(text: &Rope, pos: usize) -> (usize, Point) {
+    fn point_at_pos(text: RopeSlice, pos: usize) -> (usize, Point) {
         let byte = text.char_to_byte(pos); // <- attempted to index past end
         let line = text.char_to_line(pos);
         let line_start_byte = text.line_to_byte(line);
@@ -1122,7 +1760,7 @@ pub(crate) fn generate_edits(
 }
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{iter, mem, ops, str, usize};
+use std::{iter, mem, ops, str};
 use tree_sitter::{
     Language as Grammar, Node, Parser, Point, Query, QueryCaptures, QueryCursor, QueryError,
     QueryMatch, Range, TextProvider, Tree,
@@ -1139,6 +1777,7 @@ pub struct Highlight(pub usize);
 pub enum Error {
     Cancelled,
     InvalidLanguage,
+    InvalidRanges,
     Unknown,
 }
 
@@ -1158,12 +1797,14 @@ pub struct HighlightConfiguration {
     pub language: Grammar,
     pub query: Query,
     injections_query: Query,
-    combined_injections_query: Option<Query>,
+    combined_injections_patterns: Vec<usize>,
     highlights_pattern_index: usize,
     highlight_indices: ArcSwap<Vec<Option<Highlight>>>,
     non_local_variable_patterns: Vec<bool>,
     injection_content_capture_index: Option<u32>,
     injection_language_capture_index: Option<u32>,
+    injection_filename_capture_index: Option<u32>,
+    injection_shebang_capture_index: Option<u32>,
     local_scope_capture_index: Option<u32>,
     local_def_capture_index: Option<u32>,
     local_def_value_capture_index: Option<u32>,
@@ -1192,7 +1833,7 @@ struct HighlightIter<'a> {
     layers: Vec<HighlightIterLayer<'a>>,
     iter_count: usize,
     next_event: Option<HighlightEvent>,
-    last_highlight_range: Option<(usize, usize, usize)>,
+    last_highlight_range: Option<(usize, usize, u32)>,
 }
 
 // Adapter to convert rope chunks to bytes
@@ -1207,7 +1848,7 @@ impl<'a> Iterator for ChunksBytes<'a> {
 }
 
 pub struct RopeProvider<'a>(pub RopeSlice<'a>);
-impl<'a> TextProvider<'a> for RopeProvider<'a> {
+impl<'a> TextProvider<&'a [u8]> for RopeProvider<'a> {
     type I = ChunksBytes<'a>;
 
     fn text(&mut self, node: Node) -> Self::I {
@@ -1221,15 +1862,14 @@ impl<'a> TextProvider<'a> for RopeProvider<'a> {
 struct HighlightIterLayer<'a> {
     _tree: Option<Tree>,
     cursor: QueryCursor,
-    captures: iter::Peekable<QueryCaptures<'a, 'a, RopeProvider<'a>>>,
+    captures: RefCell<iter::Peekable<QueryCaptures<'a, 'a, RopeProvider<'a>, &'a [u8]>>>,
     config: &'a HighlightConfiguration,
     highlight_end_stack: Vec<usize>,
     scope_stack: Vec<LocalScope<'a>>,
-    depth: usize,
-    ranges: &'a [Range],
+    depth: u32,
 }
 
-impl<'a> fmt::Debug for HighlightIterLayer<'a> {
+impl fmt::Debug for HighlightIterLayer<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HighlightIterLayer").finish()
     }
@@ -1264,7 +1904,7 @@ impl HighlightConfiguration {
 
         // Construct a single query by concatenating the three query strings, but record the
         // range of pattern indices that belong to each individual string.
-        let query = Query::new(language, &query_source)?;
+        let query = Query::new(&language, &query_source)?;
         let mut highlights_pattern_index = 0;
         for i in 0..(query.pattern_count()) {
             let pattern_offset = query.start_byte_for_pattern(i);
@@ -1273,26 +1913,15 @@ impl HighlightConfiguration {
             }
         }
 
-        let mut injections_query = Query::new(language, injection_query)?;
-
-        // Construct a separate query just for dealing with the 'combined injections'.
-        // Disable the combined injection patterns in the main query.
-        let mut combined_injections_query = Query::new(language, injection_query)?;
-        let mut has_combined_queries = false;
-        for pattern_index in 0..injections_query.pattern_count() {
-            let settings = injections_query.property_settings(pattern_index);
-            if settings.iter().any(|s| &*s.key == "injection.combined") {
-                has_combined_queries = true;
-                injections_query.disable_pattern(pattern_index);
-            } else {
-                combined_injections_query.disable_pattern(pattern_index);
-            }
-        }
-        let combined_injections_query = if has_combined_queries {
-            Some(combined_injections_query)
-        } else {
-            None
-        };
+        let injections_query = Query::new(&language, injection_query)?;
+        let combined_injections_patterns = (0..injections_query.pattern_count())
+            .filter(|&i| {
+                injections_query
+                    .property_settings(i)
+                    .iter()
+                    .any(|s| &*s.key == "injection.combined")
+            })
+            .collect();
 
         // Find all of the highlighting patterns that are disabled for nodes that
         // have been identified as local variables.
@@ -1308,13 +1937,15 @@ impl HighlightConfiguration {
         // Store the numeric ids for all of the special captures.
         let mut injection_content_capture_index = None;
         let mut injection_language_capture_index = None;
+        let mut injection_filename_capture_index = None;
+        let mut injection_shebang_capture_index = None;
         let mut local_def_capture_index = None;
         let mut local_def_value_capture_index = None;
         let mut local_ref_capture_index = None;
         let mut local_scope_capture_index = None;
         for (i, name) in query.capture_names().iter().enumerate() {
             let i = Some(i as u32);
-            match name.as_str() {
+            match *name {
                 "local.definition" => local_def_capture_index = i,
                 "local.definition-value" => local_def_value_capture_index = i,
                 "local.reference" => local_ref_capture_index = i,
@@ -1325,9 +1956,11 @@ impl HighlightConfiguration {
 
         for (i, name) in injections_query.capture_names().iter().enumerate() {
             let i = Some(i as u32);
-            match name.as_str() {
+            match *name {
                 "injection.content" => injection_content_capture_index = i,
                 "injection.language" => injection_language_capture_index = i,
+                "injection.filename" => injection_filename_capture_index = i,
+                "injection.shebang" => injection_shebang_capture_index = i,
                 _ => {}
             }
         }
@@ -1337,12 +1970,14 @@ impl HighlightConfiguration {
             language,
             query,
             injections_query,
-            combined_injections_query,
+            combined_injections_patterns,
             highlights_pattern_index,
             highlight_indices,
             non_local_variable_patterns,
             injection_content_capture_index,
             injection_language_capture_index,
+            injection_filename_capture_index,
+            injection_shebang_capture_index,
             local_scope_capture_index,
             local_def_capture_index,
             local_def_value_capture_index,
@@ -1351,7 +1986,7 @@ impl HighlightConfiguration {
     }
 
     /// Get a slice containing all of the highlight names used in the configuration.
-    pub fn names(&self) -> &[String] {
+    pub fn names(&self) -> &[&str] {
         self.query.capture_names()
     }
 
@@ -1360,8 +1995,8 @@ impl HighlightConfiguration {
     /// Tree-sitter syntax-highlighting queries specify highlights in the form of dot-separated
     /// highlight names like `punctuation.bracket` and `function.method.builtin`. Consumers of
     /// these queries can choose to recognize highlights with different levels of specificity.
-    /// For example, the string `function.builtin` will match against `function.method.builtin`
-    /// and `function.builtin.constructor`, but will not match `function.method`.
+    /// For example, the string `function.builtin` will match against `function.builtin.constructor`
+    /// but will not match `function.method.builtin` and `function.method`.
     ///
     /// When highlighting, results are returned as `Highlight` values, which contain the index
     /// of the matched highlight this list of highlight names.
@@ -1378,14 +2013,15 @@ impl HighlightConfiguration {
                 let mut best_index = None;
                 let mut best_match_len = 0;
                 for (i, recognized_name) in recognized_names.iter().enumerate() {
-                    let recognized_name = recognized_name;
                     let mut len = 0;
                     let mut matches = true;
-                    for part in recognized_name.split('.') {
-                        len += 1;
-                        if !capture_parts.contains(&part) {
-                            matches = false;
-                            break;
+                    for (i, part) in recognized_name.split('.').enumerate() {
+                        match capture_parts.get(i) {
+                            Some(capture_part) if *capture_part == part => len += 1,
+                            _ => {
+                                matches = false;
+                                break;
+                            }
                         }
                     }
                     if matches && len > best_match_len {
@@ -1399,16 +2035,107 @@ impl HighlightConfiguration {
 
         self.highlight_indices.store(Arc::new(indices));
     }
+
+    fn injection_pair<'a>(
+        &self,
+        query_match: &QueryMatch<'a, 'a>,
+        source: RopeSlice<'a>,
+    ) -> (Option<InjectionLanguageMarker<'a>>, Option<Node<'a>>) {
+        let mut injection_capture = None;
+        let mut content_node = None;
+
+        for capture in query_match.captures {
+            let index = Some(capture.index);
+            if index == self.injection_language_capture_index {
+                injection_capture = Some(InjectionLanguageMarker::Name(
+                    source.byte_slice(capture.node.byte_range()),
+                ));
+            } else if index == self.injection_filename_capture_index {
+                injection_capture = Some(InjectionLanguageMarker::Filename(
+                    source.byte_slice(capture.node.byte_range()),
+                ));
+            } else if index == self.injection_shebang_capture_index {
+                let node_slice = source.byte_slice(capture.node.byte_range());
+
+                // some languages allow space and newlines before the actual string content
+                // so a shebang could be on either the first or second line
+                let lines = if let Ok(end) = node_slice.try_line_to_byte(2) {
+                    node_slice.byte_slice(..end)
+                } else {
+                    node_slice
+                };
+
+                static SHEBANG_REGEX: Lazy<rope::Regex> =
+                    Lazy::new(|| rope::Regex::new(SHEBANG).unwrap());
+
+                injection_capture = SHEBANG_REGEX
+                    .captures_iter(lines.regex_input())
+                    .map(|cap| {
+                        let cap = lines.byte_slice(cap.get_group(1).unwrap().range());
+                        InjectionLanguageMarker::Shebang(cap)
+                    })
+                    .next()
+            } else if index == self.injection_content_capture_index {
+                content_node = Some(capture.node);
+            }
+        }
+        (injection_capture, content_node)
+    }
+
+    fn injection_for_match<'a>(
+        &self,
+        query: &'a Query,
+        query_match: &QueryMatch<'a, 'a>,
+        source: RopeSlice<'a>,
+    ) -> (
+        Option<InjectionLanguageMarker<'a>>,
+        Option<Node<'a>>,
+        IncludedChildren,
+    ) {
+        let (mut injection_capture, content_node) = self.injection_pair(query_match, source);
+
+        let mut included_children = IncludedChildren::default();
+        for prop in query.property_settings(query_match.pattern_index) {
+            match prop.key.as_ref() {
+                // In addition to specifying the language name via the text of a
+                // captured node, it can also be hard-coded via a `#set!` predicate
+                // that sets the injection.language key.
+                "injection.language" if injection_capture.is_none() => {
+                    injection_capture = prop
+                        .value
+                        .as_deref()
+                        .map(InjectionLanguageMarker::LanguageId);
+                }
+
+                // By default, injections do not include the *children* of an
+                // `injection.content` node - only the ranges that belong to the
+                // node itself. This can be changed using a `#set!` predicate that
+                // sets the `injection.include-children` key.
+                "injection.include-children" => included_children = IncludedChildren::All,
+
+                // Some queries might only exclude named children but include unnamed
+                // children in their `injection.content` node. This can be enabled using
+                // a `#set!` predicate that sets the `injection.include-unnamed-children` key.
+                "injection.include-unnamed-children" => {
+                    included_children = IncludedChildren::Unnamed
+                }
+                _ => {}
+            }
+        }
+
+        (injection_capture, content_node, included_children)
+    }
 }
 
-impl<'a> HighlightIterLayer<'a> {
+impl HighlightIterLayer<'_> {
     // First, sort scope boundaries by their byte offset in the document. At a
     // given position, emit scope endings before scope beginnings. Finally, emit
     // scope boundaries from deeper layers first.
-    fn sort_key(&mut self) -> Option<(usize, bool, isize)> {
+    fn sort_key(&self) -> Option<(usize, bool, isize)> {
         let depth = -(self.depth as isize);
         let next_start = self
             .captures
+            .borrow_mut()
             .peek()
             .map(|(m, i)| m.captures[*i].node.start_byte());
         let next_end = self.highlight_end_stack.last().cloned();
@@ -1427,6 +2154,19 @@ impl<'a> HighlightIterLayer<'a> {
     }
 }
 
+#[derive(Clone)]
+enum IncludedChildren {
+    None,
+    All,
+    Unnamed,
+}
+
+impl Default for IncludedChildren {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 // Compute the ranges that should be included when parsing an injection.
 // This takes into account three things:
 // * `parent_ranges` - The ranges must all fall within the *current* layer's ranges.
@@ -1439,7 +2179,7 @@ impl<'a> HighlightIterLayer<'a> {
 fn intersect_ranges(
     parent_ranges: &[Range],
     nodes: &[Node],
-    includes_children: bool,
+    included_children: IncludedChildren,
 ) -> Vec<Range> {
     let mut cursor = nodes[0].walk();
     let mut result = Vec::new();
@@ -1463,11 +2203,15 @@ fn intersect_ranges(
 
         for excluded_range in node
             .children(&mut cursor)
-            .filter_map(|child| {
-                if includes_children {
-                    None
-                } else {
-                    Some(child.range())
+            .filter_map(|child| match included_children {
+                IncludedChildren::None => Some(child.range()),
+                IncludedChildren::All => None,
+                IncludedChildren::Unnamed => {
+                    if child.is_named() {
+                        Some(child.range())
+                    } else {
+                        None
+                    }
                 }
             })
             .chain([following_range].iter().cloned())
@@ -1521,7 +2265,7 @@ fn intersect_ranges(
     result
 }
 
-impl<'a> HighlightIter<'a> {
+impl HighlightIter<'_> {
     fn emit_event(
         &mut self,
         offset: usize,
@@ -1576,7 +2320,7 @@ impl<'a> HighlightIter<'a> {
     }
 }
 
-impl<'a> Iterator for HighlightIter<'a> {
+impl Iterator for HighlightIter<'_> {
     type Item = Result<HighlightEvent, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1616,7 +2360,8 @@ impl<'a> Iterator for HighlightIter<'a> {
             // Get the next capture from whichever layer has the earliest highlight boundary.
             let range;
             let layer = &mut self.layers[0];
-            if let Some((next_match, capture_index)) = layer.captures.peek() {
+            let captures = layer.captures.get_mut();
+            if let Some((next_match, capture_index)) = captures.peek() {
                 let next_capture = next_match.captures[*capture_index];
                 range = next_capture.node.byte_range();
 
@@ -1639,7 +2384,7 @@ impl<'a> Iterator for HighlightIter<'a> {
                 return self.emit_event(self.source.len_bytes(), None);
             };
 
-            let (mut match_, capture_index) = layer.captures.next().unwrap();
+            let (mut match_, capture_index) = captures.next().unwrap();
             let mut capture = match_.captures[capture_index];
 
             // Remove from the local scope stack any local scopes that have already ended.
@@ -1715,11 +2460,11 @@ impl<'a> Iterator for HighlightIter<'a> {
                 }
 
                 // Continue processing any additional matches for the same node.
-                if let Some((next_match, next_capture_index)) = layer.captures.peek() {
+                if let Some((next_match, next_capture_index)) = captures.peek() {
                     let next_capture = next_match.captures[*next_capture_index];
                     if next_capture.node == capture.node {
                         capture = next_capture;
-                        match_ = layer.captures.next().unwrap().0;
+                        match_ = captures.next().unwrap().0;
                         continue;
                     }
                 }
@@ -1742,11 +2487,12 @@ impl<'a> Iterator for HighlightIter<'a> {
             // highlighting patterns that are disabled for local variables.
             if definition_highlight.is_some() || reference_highlight.is_some() {
                 while layer.config.non_local_variable_patterns[match_.pattern_index] {
-                    if let Some((next_match, next_capture_index)) = layer.captures.peek() {
+                    match_.remove();
+                    if let Some((next_match, next_capture_index)) = captures.peek() {
                         let next_capture = next_match.captures[*next_capture_index];
                         if next_capture.node == capture.node {
                             capture = next_capture;
-                            match_ = layer.captures.next().unwrap().0;
+                            match_ = captures.next().unwrap().0;
                             continue;
                         }
                     }
@@ -1756,15 +2502,17 @@ impl<'a> Iterator for HighlightIter<'a> {
                 }
             }
 
-            // Once a highlighting pattern is found for the current node, skip over
-            // any later highlighting patterns that also match this node. Captures
+            // Use the last capture found for the current node, skipping over any
+            // highlight patterns that also match this node. Captures
             // for a given node are ordered by pattern index, so these subsequent
             // captures are guaranteed to be for highlighting, not injections or
             // local variables.
-            while let Some((next_match, next_capture_index)) = layer.captures.peek() {
+            while let Some((next_match, next_capture_index)) = captures.peek() {
                 let next_capture = next_match.captures[*next_capture_index];
                 if next_capture.node == capture.node {
-                    layer.captures.next();
+                    match_.remove();
+                    capture = next_capture;
+                    match_ = captures.next().unwrap().0;
                 } else {
                     break;
                 }
@@ -1791,50 +2539,25 @@ impl<'a> Iterator for HighlightIter<'a> {
     }
 }
 
-fn injection_for_match<'a>(
-    config: &HighlightConfiguration,
-    query: &'a Query,
-    query_match: &QueryMatch<'a, 'a>,
-    source: RopeSlice<'a>,
-) -> (Option<Cow<'a, str>>, Option<Node<'a>>, bool) {
-    let content_capture_index = config.injection_content_capture_index;
-    let language_capture_index = config.injection_language_capture_index;
-
-    let mut language_name = None;
-    let mut content_node = None;
-    for capture in query_match.captures {
-        let index = Some(capture.index);
-        if index == language_capture_index {
-            let name = byte_range_to_str(capture.node.byte_range(), source);
-            language_name = Some(name);
-        } else if index == content_capture_index {
-            content_node = Some(capture.node);
-        }
-    }
-
-    let mut include_children = false;
-    for prop in query.property_settings(query_match.pattern_index) {
-        match prop.key.as_ref() {
-            // In addition to specifying the language name via the text of a
-            // captured node, it can also be hard-coded via a `#set!` predicate
-            // that sets the injection.language key.
-            "injection.language" => {
-                if language_name.is_none() {
-                    language_name = prop.value.as_ref().map(|s| s.as_ref().into())
-                }
-            }
-
-            // By default, injections do not include the *children* of an
-            // `injection.content` node - only the ranges that belong to the
-            // node itself. This can be changed using a `#set!` predicate that
-            // sets the `injection.include-children` key.
-            "injection.include-children" => include_children = true,
-            _ => {}
-        }
-    }
-
-    (language_name, content_node, include_children)
+#[derive(Debug, Clone)]
+pub enum InjectionLanguageMarker<'a> {
+    /// The language is specified by `LanguageConfiguration`'s `language_id` field.
+    ///
+    /// This marker is used when a pattern sets the `injection.language` property, for example
+    /// `(#set! injection.language "rust")`.
+    LanguageId(&'a str),
+    /// The language is specified in the document and captured by `@injection.language`.
+    ///
+    /// This is used for markdown code fences for example. While the `LanguageId` variant can be
+    /// looked up by finding the language config that sets an `language_id`, this variant contains
+    /// text from the document being highlighted, so the text is checked against each language's
+    /// `injection_regex`.
+    Name(RopeSlice<'a>),
+    Filename(RopeSlice<'a>),
+    Shebang(RopeSlice<'a>),
 }
+
+const SHEBANG: &str = r"#!\s*(?:\S*[/\\](?:env\s+(?:\-\S+\s+)*)?)?([^\s\.\d]+)";
 
 pub struct Merge<I> {
     iter: I,
@@ -1970,6 +2693,78 @@ impl<I: Iterator<Item = HighlightEvent>> Iterator for Merge<I> {
     }
 }
 
+fn node_is_visible(node: &Node) -> bool {
+    node.is_missing() || (node.is_named() && node.language().node_kind_is_visible(node.kind_id()))
+}
+
+fn format_anonymous_node_kind(kind: &str) -> Cow<str> {
+    if kind.contains('"') {
+        Cow::Owned(kind.replace('"', "\\\""))
+    } else {
+        Cow::Borrowed(kind)
+    }
+}
+
+pub fn pretty_print_tree<W: fmt::Write>(fmt: &mut W, node: Node) -> fmt::Result {
+    if node.child_count() == 0 {
+        if node_is_visible(&node) {
+            write!(fmt, "({})", node.kind())
+        } else {
+            write!(fmt, "\"{}\"", format_anonymous_node_kind(node.kind()))
+        }
+    } else {
+        pretty_print_tree_impl(fmt, &mut node.walk(), 0)
+    }
+}
+
+fn pretty_print_tree_impl<W: fmt::Write>(
+    fmt: &mut W,
+    cursor: &mut tree_sitter::TreeCursor,
+    depth: usize,
+) -> fmt::Result {
+    let node = cursor.node();
+    let visible = node_is_visible(&node);
+
+    if visible {
+        let indentation_columns = depth * 2;
+        write!(fmt, "{:indentation_columns$}", "")?;
+
+        if let Some(field_name) = cursor.field_name() {
+            write!(fmt, "{}: ", field_name)?;
+        }
+
+        write!(fmt, "({}", node.kind())?;
+    } else {
+        write!(fmt, " \"{}\"", format_anonymous_node_kind(node.kind()))?;
+    }
+
+    // Handle children.
+    if cursor.goto_first_child() {
+        loop {
+            if node_is_visible(&cursor.node()) {
+                fmt.write_char('\n')?;
+            }
+
+            pretty_print_tree_impl(fmt, cursor, depth + 1)?;
+
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+
+        let moved = cursor.goto_parent();
+        // The parent of the first child must exist, and must be `node`.
+        debug_assert!(moved);
+        debug_assert!(cursor.node() == node);
+    }
+
+    if visible {
+        fmt.write_char(')')?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1989,15 +2784,24 @@ mod test {
         "#,
         );
 
-        let loader = Loader::new(Configuration { language: vec![] });
-        let language = get_language("Rust").unwrap();
+        let loader = Loader::new(Configuration {
+            language: vec![],
+            language_server: HashMap::new(),
+        })
+        .unwrap();
+        let language = get_language("rust").unwrap();
 
-        let query = Query::new(language, query_str).unwrap();
+        let query = Query::new(&language, query_str).unwrap();
         let textobject = TextObjectQuery { query };
         let mut cursor = QueryCursor::new();
 
         let config = HighlightConfiguration::new(language, "", "", "").unwrap();
-        let syntax = Syntax::new(&source, Arc::new(config), Arc::new(loader));
+        let syntax = Syntax::new(
+            source.slice(..),
+            Arc::new(config),
+            Arc::new(ArcSwap::from_pointee(loader)),
+        )
+        .unwrap();
 
         let root = syntax.tree().root_node();
         let mut test = |capture, range| {
@@ -2015,10 +2819,10 @@ mod test {
             )
         };
 
-        test("quantified_nodes", 1..36);
+        test("quantified_nodes", 1..37);
         // NOTE: Enable after implementing proper node group capturing
-        // test("quantified_nodes_grouped", 1..36);
-        // test("multiple_nodes_grouped", 1..36);
+        // test("quantified_nodes_grouped", 1..37);
+        // test("multiple_nodes_grouped", 1..37);
     }
 
     #[test]
@@ -2048,9 +2852,13 @@ mod test {
         .map(String::from)
         .collect();
 
-        let loader = Loader::new(Configuration { language: vec![] });
+        let loader = Loader::new(Configuration {
+            language: vec![],
+            language_server: HashMap::new(),
+        })
+        .unwrap();
 
-        let language = get_language("Rust").unwrap();
+        let language = get_language("rust").unwrap();
         let config = HighlightConfiguration::new(
             language,
             &std::fs::read_to_string("../runtime/grammars/sources/rust/queries/highlights.scm")
@@ -2068,7 +2876,12 @@ mod test {
             fn main() {}
         ",
         );
-        let syntax = Syntax::new(&source, Arc::new(config), Arc::new(loader));
+        let syntax = Syntax::new(
+            source.slice(..),
+            Arc::new(config),
+            Arc::new(ArcSwap::from_pointee(loader)),
+        )
+        .unwrap();
         let tree = syntax.tree();
         let root = tree.root_node();
         assert_eq!(root.kind(), "source_file");
@@ -2095,7 +2908,7 @@ mod test {
             &doc,
             vec![(6, 11, Some("test".into())), (12, 17, None)].into_iter(),
         );
-        let edits = generate_edits(&doc, transaction.changes());
+        let edits = generate_edits(doc.slice(..), transaction.changes());
         // transaction.apply(&mut state);
 
         assert_eq!(
@@ -2124,7 +2937,7 @@ mod test {
         let mut doc = Rope::from("fn test() {}");
         let transaction =
             Transaction::change(&doc, vec![(8, 8, Some("a: u32".into()))].into_iter());
-        let edits = generate_edits(&doc, transaction.changes());
+        let edits = generate_edits(doc.slice(..), transaction.changes());
         transaction.apply(&mut doc);
 
         assert_eq!(doc, "fn test(a: u32) {}");
@@ -2138,6 +2951,103 @@ mod test {
                 old_end_position: Point { row: 0, column: 8 },
                 new_end_position: Point { row: 0, column: 14 }
             }]
+        );
+    }
+
+    #[track_caller]
+    fn assert_pretty_print(
+        language_name: &str,
+        source: &str,
+        expected: &str,
+        start: usize,
+        end: usize,
+    ) {
+        let source = Rope::from_str(source);
+
+        let loader = Loader::new(Configuration {
+            language: vec![],
+            language_server: HashMap::new(),
+        })
+        .unwrap();
+        let language = get_language(language_name).unwrap();
+
+        let config = HighlightConfiguration::new(language, "", "", "").unwrap();
+        let syntax = Syntax::new(
+            source.slice(..),
+            Arc::new(config),
+            Arc::new(ArcSwap::from_pointee(loader)),
+        )
+        .unwrap();
+
+        let root = syntax
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(start, end)
+            .unwrap();
+
+        let mut output = String::new();
+        pretty_print_tree(&mut output, root).unwrap();
+
+        assert_eq!(expected, output);
+    }
+
+    #[test]
+    fn test_pretty_print() {
+        let source = r#"// Hello"#;
+        assert_pretty_print("rust", source, "(line_comment \"//\")", 0, source.len());
+
+        // A large tree should be indented with fields:
+        let source = r#"fn main() {
+            println!("Hello, World!");
+        }"#;
+        assert_pretty_print(
+            "rust",
+            source,
+            concat!(
+                "(function_item \"fn\"\n",
+                "  name: (identifier)\n",
+                "  parameters: (parameters \"(\" \")\")\n",
+                "  body: (block \"{\"\n",
+                "    (expression_statement\n",
+                "      (macro_invocation\n",
+                "        macro: (identifier) \"!\"\n",
+                "        (token_tree \"(\"\n",
+                "          (string_literal \"\\\"\"\n",
+                "            (string_content) \"\\\"\") \")\")) \";\") \"}\"))",
+            ),
+            0,
+            source.len(),
+        );
+
+        // Selecting a token should print just that token:
+        let source = r#"fn main() {}"#;
+        assert_pretty_print("rust", source, r#""fn""#, 0, 1);
+
+        // Error nodes are printed as errors:
+        let source = r#"}{"#;
+        assert_pretty_print("rust", source, "(ERROR \"}\" \"{\")", 0, source.len());
+
+        // Fields broken under unnamed nodes are determined correctly.
+        // In the following source, `object` belongs to the `singleton_method`
+        // rule but `name` and `body` belong to an unnamed helper `_method_rest`.
+        // This can cause a bug with a pretty-printing implementation that
+        // uses `Node::field_name_for_child` to determine field names but is
+        // fixed when using `tree_sitter::TreeCursor::field_name`.
+        let source = "def self.method_name
+          true
+        end";
+        assert_pretty_print(
+            "ruby",
+            source,
+            concat!(
+                "(singleton_method \"def\"\n",
+                "  object: (self) \".\"\n",
+                "  name: (identifier)\n",
+                "  body: (body_statement\n",
+                "    (true)) \"end\")"
+            ),
+            0,
+            source.len(),
         );
     }
 
